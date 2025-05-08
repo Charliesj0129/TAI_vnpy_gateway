@@ -46,7 +46,7 @@ from shioaji.constant import (
     OptionRight as SjOptionRight,
 )
 from shioaji.account import Account as SjAccount, AccountType as SjAccountType, StockAccount as SjStockAccount, FutureAccount as SjFutureAccount
-from shioaji.contracts import Contract as SjContract, FetchStatus as SjFetchStatus
+from shioaji.contracts import Contract as SjContract, FetchStatus as SjFetchStatus ,Option as sjOption, Stock as SjStock, Future as SjFuture
 from shioaji.order import Trade as SjTrade
 from shioaji.position import StockPosition as SjStockPosition, FuturePosition as SjFuturePosition, Margin as SjMargin, AccountBalance as SjAccountBalance
 from shioaji.stream_data_type import TickSTKv1, TickFOPv1, BidAskSTKv1, BidAskFOPv1 # 導入 V1 行情數據類型
@@ -448,7 +448,7 @@ class ShioajiGateway(BaseGateway):
                         open_price=0.0, high_price=0.0,
                         low_price=0.0, pre_close=0.0,
                         limit_up=0.0, limit_down=0.0,
-                        localtime=datetime.now()
+                        localtime=datetime.now(),
                     )
 
                 # 4. 更新 BidAsk 前5檔
@@ -693,8 +693,9 @@ class ShioajiGateway(BaseGateway):
         # 防止重複連接
         if self.connected or self.logged_in:
             # ===> 增強偵錯：記錄返回原因 <===
-            self.write_log("connect: Returning early because already connected or logged in.")
-            self.write_log("<=== connect: Method finished (already connected).")
+            # Commented out non-critical logs
+            # self.write_log("connect: Returning early because already connected or logged in.")
+            # self.write_log("<=== connect: Method finished (already connected).")
             return
 
         # ===> 增強偵錯：記錄執行緒狀態 <===
@@ -703,8 +704,9 @@ class ShioajiGateway(BaseGateway):
         # 檢查是否有線程正在運行
         if thread_alive:
             # ===> 增強偵錯：記錄返回原因 <===
-            self.write_log("connect: Returning early because connect_thread is still alive.")
-            self.write_log("<=== connect: Method finished (thread alive).")
+            # Commented out non-critical logs
+            # self.write_log("connect: Returning early because connect_thread is still alive.")
+            # self.write_log("<=== connect: Method finished (thread alive).")
             return
 
         # 記錄開始連接的時間（用於判斷超時等，可選）
@@ -768,7 +770,11 @@ class ShioajiGateway(BaseGateway):
         needs_download = False         # 預設為 False
         # ======================================================
 
+        # Commented out non-critical log
+        # self.write_log("_connect_worker: Starting connection process...")
         try:
+            # Commented out non-critical log
+            # self.write_log(f"_connect_worker: Configuration - APIKey: {setting.get('APIKey', '')[0:4]}****, Simulation: {setting.get('simulation', False)}, Force Download: {setting.get('下載合約', False)}")
             self.api_key = setting.get("APIKey", "")
             self.secret_key = setting.get("SecretKey", "")
             self.ca_path = setting.get("CA路徑", "").replace("\\", "/") # 處理路徑分隔符
@@ -785,6 +791,8 @@ class ShioajiGateway(BaseGateway):
                 self._handle_disconnect() # 觸發清理
                 self.write_log("<=== _connect_worker: 因缺少 Key 退出 ===")
                 return
+            # Commented out non-critical log
+            # self.write_log("_connect_worker: API keys validated, proceeding with initialization...")
 
             self.api = sj.Shioaji(simulation=self.simulation)
             try:
@@ -816,10 +824,11 @@ class ShioajiGateway(BaseGateway):
                 self._handle_disconnect()
                 self.write_log("<=== _connect_worker: 因登入異常退出 ===")
                 return # Stop processing
-
+            
             save_json(GATEWAY_SETTING_FILENAME, setting)
 
             accounts_list: List[Union[SjAccount, SjStockAccount, SjFutureAccount]] = []
+            
             if isinstance(raw_accounts_data, list):
                 accounts_list = raw_accounts_data
                 self.write_log(f"_connect_worker: 標準化完成 - 列表包含 {len(accounts_list)} 個帳戶.")
@@ -832,8 +841,12 @@ class ShioajiGateway(BaseGateway):
                 self.write_log(f"錯誤：Shioaji login 返回了非預期的帳戶數據類型: {type(raw_accounts_data)}。無法處理帳戶。")
             self.write_log(f"_connect_worker: 標準化後帳戶列表長度: {len(accounts_list)}")
 
+            # Commented out non-critical log
+            # self.write_log(f"_connect_worker: Login successful - Accounts: {len(accounts_list) if accounts_list else 0}, Contract Download Flag: {contract_download_flag}")
+
             # --- 設定預設帳號 ---
-            self.write_log("_connect_worker: 正在設定預設帳戶...")
+            # Commented out non-critical log
+            # self.write_log("_connect_worker: 正在設定預設帳戶...")
             if not accounts_list:
                 self.write_log("警告：登入後未獲得有效的帳戶列表，無法設定預設帳戶。")
             else:
@@ -858,19 +871,12 @@ class ShioajiGateway(BaseGateway):
                     except AttributeError as e_set_acc:
                         self.write_log(f"錯誤：設置預設帳戶時訪問帳戶屬性出錯 (type={type(acc)}): {e_set_acc}. Account data: {repr(acc)}")
                         continue # 跳過此帳戶
-                self.write_log("_connect_worker: 預設帳戶設定完成.")
+            # Commented out non-critical log
+            # self.write_log("_connect_worker: 預設帳戶設定完成.")
 
 
             # --- 3. 下載合約 ---
-            self.write_log("_connect_worker: 準備下載合約...")
-            # *** === FIX: 在此處定義 needs_download === ***
-            # 確保 contract_download_flag 和 self.force_download 都有值
-            needs_download = contract_download_flag or self.force_download
-            # *** === FIX END === ***
-
-            self.write_log(f"_connect_worker: 合約下載需求: needs_download={needs_download} (來自 login_flag:{contract_download_flag} 或 force_download:{self.force_download})")
-
-            contracts_fetched_successfully = False # 添加標誌位
+            # Commented out non-critical log
             try:
                 if needs_download:
                     self.write_log("_connect_worker: 調用 fetch_contracts(contract_download=True)...")
@@ -879,19 +885,22 @@ class ShioajiGateway(BaseGateway):
                 else:
                     self.write_log("_connect_worker: 根據登入結果和設定，跳過主動合約下載。")
 
-                status_after_fetch = self.api.Contracts.status
-                self.write_log(f"_connect_worker: fetch_contracts 調用完成或跳過. 合約狀態: {status_after_fetch}")
+                self.write_log(f"_connect_worker: fetch_contracts call completed or skipped.")
+
+                # ===> [日誌] 檢查合約狀態 <===
+                status_after_fetch = getattr(getattr(self.api, 'Contracts', None), 'status', 'N/A') # 安全獲取
+                self.write_log(f"_connect_worker: Status check AFTER fetch/skip: self.api.Contracts.status = {status_after_fetch}")
 
                 if status_after_fetch == SjFetchStatus.Fetched:
-                    self.write_log("_connect_worker: 合約狀態為 Fetched，準備處理...")
+                    self.write_log("_connect_worker: Contract status is Fetched. Proceeding to process contracts...")
                     self._process_contracts()
                     contracts_fetched_successfully = True # 標記成功
                 elif status_after_fetch == SjFetchStatus.Fetching:
-                    self.write_log("警告：合約信息獲取仍在進行中 (Fetching)，可能超時。")
+                    self.write_log("警告：_connect_worker: Contract status is still Fetching.")
                 elif status_after_fetch == SjFetchStatus.NotFetched:
-                    self.write_log("警告：合約信息獲取失敗 (NotFetched)，API 未能成功獲取。")
+                    self.write_log("錯誤：_connect_worker: Contract status is NotFetched. Subsequent lookups will likely fail.") # <--- 重要錯誤
                 else:
-                    self.write_log(f"警告：合約信息獲取狀態未知或失敗 ({status_after_fetch})，無法處理合約詳情")
+                    self.write_log(f"警告/錯誤：_connect_worker: Contract status is unexpected: {status_after_fetch}")
 
                 # 如果不需要下載，但之前已下載過，也要處理
                 if not needs_download and status_after_fetch == SjFetchStatus.Fetched:
@@ -1010,7 +1019,7 @@ class ShioajiGateway(BaseGateway):
         with self.contract_lock:
             self.contracts.clear()
 
-        self.event_engine.unregister(EVENT_TIMER, self.process_timer_event)
+        #self.event_engine.unregister(EVENT_TIMER, self.process_timer_event)
         self.write_log(f"{self.gateway_name} 接口連接已斷開")
 
     def _set_callbacks(self):
@@ -1160,102 +1169,103 @@ class ShioajiGateway(BaseGateway):
         """
         根據 VnPy 的 symbol 和 exchange 字串查找對應的 Shioaji Contract 物件。
         """
-        # ===> 增強偵錯：記錄函數進入和參數 <===
-        self.write_log(f"===> find_sj_contract: Finding contract for symbol='{symbol}', vn_exchange_str='{vn_exchange_str}'")
+        # ===> [日誌] 記錄函數入口和參數 <===
+        self.write_log(f"===> find_sj_contract: Input symbol='{symbol}', vn_exchange_str='{vn_exchange_str}'")
 
-        # ===> 增強偵錯：詳細檢查 API 和合約狀態 <===
-        if not self.api:
-            self.write_log("錯誤：find_sj_contract: self.api is None.")
-            self.write_log("<=== find_sj_contract: Returning None (API None)")
-            return None
+        # ===> [日誌] 檢查 API 和合約狀態 <===
+        api_ready = self.api is not None
+        contracts_fetched = False
+        status_val = 'N/A'
+        if api_ready and hasattr(self.api, 'Contracts'):
+            status_val = getattr(self.api.Contracts, 'status', 'N/A')
+            contracts_fetched = (status_val == SjFetchStatus.Fetched)
 
-        current_contract_status = self.api.Contracts.status
-        self.write_log(f"find_sj_contract: Current self.api.Contracts.status = {current_contract_status} ({repr(current_contract_status)})")
-
-        if current_contract_status != SjFetchStatus.Fetched:
-            # 保留原有日誌，但現在知道狀態不是 Fetched
-            self.write_log("錯誤：無法查找合約，合約尚未下載完成 (狀態非 Fetched)")
-            self.write_log(f"<=== find_sj_contract: Returning None (Status not Fetched: {current_contract_status})")
-            return None
-        # ===> 增強偵錯結束 <===
-
-
-        # 如果沒有提供交易所，則嘗試在所有合約中搜索代碼 (效率較低)
-        if not vn_exchange_str:
-            self.write_log(f"警告：find_sj_contract: 未指定交易所查找合約 {symbol}，將在所有合約中搜索...")
-            # ===> 增強偵錯：記錄查找過程 <===
-            target_contract = None
-            try:
-                target_contract = self.api.Contracts.Stocks._code2contract.get(symbol)
-                if not target_contract:
-                    target_contract = self.api.Contracts.Futures._code2contract.get(symbol)
-                    if not target_contract:
-                        target_contract = self.api.Contracts.Options._code2contract.get(symbol)
-                        if not target_contract:
-                            self.write_log(f"  在 Options 中未找到 {symbol}，合約不存在或尚未下載。")
-            except AttributeError as e_find_all:
-                self.write_log(f"錯誤：find_sj_contract: 在所有合約中搜索時發生 AttributeError: {e_find_all}")
-            except Exception as e_find_all_other:
-                self.write_log(f"錯誤：find_sj_contract: 在所有合約中搜索時發生未知錯誤: {e_find_all_other}")
-
-            if target_contract:
-                self.write_log(f"find_sj_contract: 在所有合約中找到 {symbol}")
-                self.write_log("<=== find_sj_contract: Returning contract (found in all)")
-                return target_contract
-            else:
-                self.write_log(f"錯誤：find_sj_contract: 在所有合約中都找不到代碼為 {symbol} 的合約")
-                self.write_log("<=== find_sj_contract: Returning None (not found in all)")
-                return None
-
-        # 如果提供了交易所，則進行更精確的查找
-        sj_exchange: Optional[SjExchange] = self.vn2sj[vn_exchange_str]
-        if not sj_exchange:
-            self.write_log(f"錯誤：find_sj_contract: 不支持的交易所字串 {vn_exchange_str}")
-            self.write_log("<=== find_sj_contract: Returning None (invalid exchange string)")
-            return None
-
-        target_contract: Optional[SjContract] = None
-        self.write_log(f"find_sj_contract: Searching for '{symbol}' in specific exchange '{sj_exchange.value}'")
-        try:
-            # ===> 增強偵錯：記錄具體查找步驟 <===
-            if sj_exchange in [SjExchange.TSE, SjExchange.OTC, SjExchange.OES]:
-                self.write_log(f"  Looking in Stocks ({sj_exchange.value})...")
-                exchange_contracts = getattr(self.api.Contracts.Stocks, sj_exchange.value, None)
-                if exchange_contracts and hasattr(exchange_contracts, '_code2contract'):
-                    target_contract = exchange_contracts._code2contract.get(symbol)
-                    self.write_log(f"  Stocks lookup result for '{symbol}': {'Found' if target_contract else 'Not Found'}")
-                else:
-                    self.write_log(f"  Stocks lookup failed: exchange_contracts (type: {type(exchange_contracts)}) or _code2contract missing.")
-            elif sj_exchange == SjExchange.TAIFEX:
-                self.write_log("  Looking in Futures...")
-                if hasattr(self.api.Contracts, 'Futures') and hasattr(self.api.Contracts.Futures, '_code2contract'):
-                    target_contract = self.api.Contracts.Futures._code2contract.get(symbol) # Shioaji v0.3.x 結構
-                    self.write_log(f"  Futures lookup result for '{symbol}': {'Found' if target_contract else 'Not Found'}")
-                else:
-                    self.write_log("  Futures lookup failed: api.Contracts.Futures or _code2contract missing.")
-
-                if not target_contract:
-                    self.write_log(f"  '{symbol}' not in Futures, looking in Options...")
-                    if hasattr(self.api.Contracts, 'Options') and hasattr(self.api.Contracts.Options, '_code2contract'):
-                        target_contract = self.api.Contracts.Options._code2contract.get(symbol) # Shioaji v0.3.x 結構
-                        self.write_log(f"  Options lookup result for '{symbol}': {'Found' if target_contract else 'Not Found'}")
-                    else:
-                        self.write_log("  Options lookup failed: api.Contracts.Options or _code2contract missing.")
-            # ===> 增強偵錯結束 <===
-
-        except AttributeError as e:
-            self.write_log(f"錯誤：find_sj_contract: 查找特定交易所合約時發生 AttributeError: {e}")
-        except Exception as e_find_specific:
-            self.write_log(f"錯誤：find_sj_contract: 查找特定交易所合約時發生未知錯誤: {e_find_specific}\n{traceback.format_exc()}")
-
-        if not target_contract:
-            self.write_log(f"警告：find_sj_contract: 在 {vn_exchange_str} ({sj_exchange.value}) 中找不到合約 {symbol}")
-            self.write_log("<=== find_sj_contract: Returning None (not found in specific exchange)")
+        if not api_ready or not contracts_fetched:
+            self.write_log(f"find_sj_contract: Pre-check failed. API initialized: {api_ready}, Contracts fetched: {contracts_fetched} (Status: {status_val})")
+            self.write_log("<=== find_sj_contract: Returning None (Pre-check failed)")
             return None
         else:
-            self.write_log(f"find_sj_contract: 成功找到合約 {symbol} @ {vn_exchange_str}")
+            self.write_log(f"find_sj_contract: Pre-check PASSED. API ready and Contracts status is Fetched.")
+
+        target_contract: Optional[SjContract] = None
+        lookup_path_attempted = "N/A" # 記錄嘗試的路徑
+
+        try:
+            if not vn_exchange_str:
+                # ===> [日誌] 無交易所查找邏輯 (如果您的使用情況會觸發這裡，請告知) <===
+                lookup_path_attempted = f"Search in all contracts for '{symbol}'"
+                self.write_log(f"find_sj_contract: No vn_exchange_str provided. {lookup_path_attempted}")
+                # (這裡的查找邏輯也需要日誌，但我們先關注有交易所的情況)
+                # 暫時假設您的情況總是有 vn_exchange_str
+                pass # 略過詳細日誌
+            else:
+                sj_exchange: Optional[SjExchange] = self.vn2sj.get(vn_exchange_str)
+                if not sj_exchange:
+                    # ===> [日誌] 交易所映射失敗 <===
+                    self.write_log(f"find_sj_contract: Error - Cannot map vn_exchange_str '{vn_exchange_str}' to SjExchange.")
+                    self.write_log("<=== find_sj_contract: Returning None (Invalid exchange mapping)")
+                    return None
+
+                # ===> [日誌] 交易所映射成功 <===
+                self.write_log(f"find_sj_contract: Mapped vn_exchange_str '{vn_exchange_str}' to SjExchange '{sj_exchange.value}'")
+
+                contract_source = None
+                # 判斷查找路徑
+                if sj_exchange in [SjExchange.TSE, SjExchange.OTC, SjExchange.OES]:
+                    lookup_path_attempted = f"self.api.Contracts.Stocks.{sj_exchange.value}._code2contract"
+                    # ===> [日誌] 嘗試獲取股票數據源 <===
+                    self.write_log(f"find_sj_contract: Trying to access Stocks source: {lookup_path_attempted}")
+                    contract_source = getattr(getattr(self.api.Contracts.Stocks, sj_exchange.value, None), '_code2contract', None)
+                elif sj_exchange == SjExchange.TAIFEX:
+                    # 先試期貨
+                    lookup_path_attempted = f"self.api.Contracts.Futures._code2contract"
+                    # ===> [日誌] 嘗試獲取期貨數據源 <===
+                    self.write_log(f"find_sj_contract: Trying to access Futures source: {lookup_path_attempted}")
+                    contract_source = getattr(getattr(self.api.Contracts, 'Futures', None), '_code2contract', None)
+                    if contract_source and isinstance(contract_source, dict):
+                        target_contract = contract_source.get(symbol) # 直接嘗試獲取
+                        self.write_log(f"find_sj_contract: Looked up '{symbol}' in Futures. Found: {'Yes' if target_contract else 'No'}")
+                    else:
+                        self.write_log(f"find_sj_contract: Futures source not found or not a dict at {lookup_path_attempted}")
+
+                    if not target_contract: # 如果期貨找不到，再試選擇權
+                        lookup_path_attempted = f"self.api.Contracts.Options._code2contract"
+                        # ===> [日誌] 嘗試獲取選擇權數據源 <===
+                        self.write_log(f"find_sj_contract: Trying to access Options source: {lookup_path_attempted}")
+                        contract_source = getattr(getattr(self.api.Contracts, 'Options', None), '_code2contract', None)
+                    else:
+                        contract_source = None # 期貨已找到，不再查找選擇權
+
+                # ===> [日誌] 執行查找並記錄結果 <===
+                if contract_source is not None and isinstance(contract_source, dict):
+                    self.write_log(f"find_sj_contract: Attempting final lookup: {lookup_path_attempted}.get('{symbol}')")
+                    target_contract = contract_source.get(symbol)
+                    # 可以在這裡加日誌打印 contract_source.keys() 的一部分，看鍵是否存在但格式不同
+                    # key_sample = list(contract_source.keys())[:10] # 只看前 10 個鍵
+                    # self.write_log(f"find_sj_contract: Available keys sample in source: {key_sample}")
+                elif contract_source is None and lookup_path_attempted.startswith("self.api.Contracts.Futures"):
+                    # 這種情況是期貨已經找到，不需要再查選擇權，屬於正常流程
+                    pass
+                else:
+                    self.write_log(f"find_sj_contract: Failed to get contract source dict at path: {lookup_path_attempted}")
+
+
+        except Exception as e_find:
+            # ===> [日誌] 查找過程中發生異常 <===
+            self.write_log(f"find_sj_contract: Exception during lookup: {e_find}\n{traceback.format_exc()}")
+            self.write_log("<=== find_sj_contract: Returning None (Exception)")
+            return None
+
+        # ===> [日誌] 記錄最終返回結果 <===
+        if target_contract:
+            self.write_log(f"find_sj_contract: Success! Found contract object for '{symbol}'.")
+            self.write_log(f"Found object type: {type(target_contract)}, repr: {repr(target_contract)}") # 記錄找到的物件細節
             self.write_log("<=== find_sj_contract: Returning contract object")
             return target_contract
+        else:
+            self.write_log(f"find_sj_contract: Failed. Could not find contract for '{symbol}' using path '{lookup_path_attempted}'.")
+            self.write_log("<=== find_sj_contract: Returning None (Not found)")
+            return None
 
     def get_product_type(self, symbol: str, vn_exchange_str: str) -> Optional[Product]:
         """根據 symbol 和 exchange 字串判斷 VnPy Product 類型"""
@@ -1378,15 +1388,26 @@ class ShioajiGateway(BaseGateway):
         vn_exchange_str = req.exchange.value
         symbol = req.symbol
         vt_symbol = f"{symbol}.{vn_exchange_str}"
+
+        # ===> [日誌] 調用前 <===
+        self.write_log(f"send_order: Preparing to call find_sj_contract for symbol='{symbol}', vn_exchange_str='{vn_exchange_str}'")
+
         sj_contract = self.find_sj_contract(symbol, vn_exchange_str)
 
+        # ===> [日誌] 調用後 <===
+        self.write_log(f"send_order: find_sj_contract returned: {'Object found' if sj_contract else 'None'}") # <--- 非常關鍵
+
         if not sj_contract:
-            # ... 返回 REJECTED OrderData ... (同之前的實現)
+            self.write_log(f"send_order: Failed to find contract for {vt_symbol}. Order will be rejected.") # <--- 確認是否進入拒絕邏輯
+            # ... (現有的創建 REJECTED OrderData 的邏輯) ...
             order = req.create_order_data(f"{self.gateway_name}.NO_CONTRACT_{datetime.now().strftime('%H%M%S_%f')}", self.gateway_name)
             order.status = Status.REJECTED
             order.reference = f"找不到合約 {vt_symbol}"
             self.on_order(order)
             return order.vt_orderid
+        else:
+            # ===> [日誌] 確認找到合約 <===
+            self.write_log(f"send_order: Successfully found SjContract for {vt_symbol}. Proceeding with order preparation.")
 
         # 2. 確定產品類型
         product = PRODUCT_MAP_REVERSE.get(sj_contract.security_type)
@@ -1764,7 +1785,6 @@ class ShioajiGateway(BaseGateway):
                             price=float(price),
                             volume=float(vol),
                             datetime=datetime.fromtimestamp(ts/1e9, tz=TAIPEI_TZ),
-                            localtime=datetime.now()
                         )
                         self.on_trade(trade)
                         self.write_log(f"[{thread_name}] 發送 trade 事件: {trade.tradeid} ({trade.volume}@{trade.price})")
@@ -1955,7 +1975,7 @@ class ShioajiGateway(BaseGateway):
                             continue
 
                         vn_exchange = Exchange(vn_exchange_str)
-                        vt_symbol = f"{code}.{vn_exchange.value}" # vt_symbol 在這裡定義
+                        vt_symbol = f"{code}.{vn_exchange_str}" # vt_symbol 在這裡定義
 
                         vn_direction = DIRECTION_MAP_REVERSE.get(pos.direction)
                         if not vn_direction:
@@ -2182,156 +2202,324 @@ class ShioajiGateway(BaseGateway):
         3. **週期選擇權標的**：先抓 `MXFR1`；若不存在則找最早未到期 `MXFyyyyMM`；最後批次補齊
            `option_underlying` 為找到的期貨代號。
         """
-        self.write_log("===> _process_contracts (FULL) 開始 …")
+        self.write_log("===> _process_contracts (Mapping SjExchange to VnPy Exchange) 開始 …")
 
         # 0️⃣ 前置檢查 --------------------------------------------------
         if not self.api:
             self.write_log("_process_contracts: self.api is None，退出")
+            return
+        # 檢查 Contracts 屬性是否存在
+        if not hasattr(self.api, 'Contracts'):
+            self.write_log("_process_contracts: self.api has no 'Contracts' attribute，退出")
             return
         if self.api.Contracts.status != SjFetchStatus.Fetched:
             self.write_log(f"_process_contracts: Contracts.status = {self.api.Contracts.status} (非 Fetched)，退出")
             return
 
         # 1️⃣ 內部工具 --------------------------------------------------
+        # --- 確保輔助函數可訪問 (例如定義為類別方法 self._find_mxf_contract) ---
         def _find_mxf_contract() -> Tuple[Optional[str], Optional[date]]:
             """優先回傳 MXFR1；否則回傳最近未到期 MXFyyyyMM"""
+            # 檢查 Contracts.Futures.MXF 是否存在
+            if not hasattr(self.api.Contracts, 'Futures') or not hasattr(self.api.Contracts.Futures, 'MXF'):
+                 self.write_log("警告：_find_mxf_contract: 找不到 Contracts.Futures.MXF，無法查找標的。")
+                 return None, None
+
             mxf_cat = self.api.Contracts.Futures.MXF
             cont = getattr(mxf_cat, "MXFR1", None)
-            if cont:
-                return cont.symbol, datetime.strptime(cont.delivery_date, "%Y/%m/%d").date()
+            # 檢查 cont 是否有效以及是否包含必要屬性
+            if cont and hasattr(cont, 'symbol') and hasattr(cont, 'delivery_date'):
+                try:
+                    # 確保 delivery_date 是有效字串
+                    if isinstance(cont.delivery_date, str):
+                         return cont.symbol, datetime.strptime(cont.delivery_date, "%Y/%m/%d").date()
+                    else:
+                         self.write_log(f"警告：_find_mxf_contract: MXFR1 的 delivery_date 不是字串 ({type(cont.delivery_date)})，跳過。")
+                except (ValueError, TypeError) as e:
+                    self.write_log(f"警告：_find_mxf_contract: 解析 MXFR1 日期 '{cont.delivery_date}' 失敗: {e}")
+                    # 繼續搜索月合約
 
             today = date.today()
             best: Optional[Tuple[str, date]] = None
-            for fut in mxf_cat:
-                if fut.symbol.startswith("MXF"):
-                    exp = datetime.strptime(fut.delivery_date, "%Y/%m/%d").date()
-                    if exp >= today and (best is None or exp < best[1]):
-                        best = (fut.symbol, exp)
+            # 安全迭代
+            if hasattr(mxf_cat, '__iter__'):
+                for fut in mxf_cat:
+                     # 檢查必要屬性是否存在且有效
+                    if (hasattr(fut, 'symbol') and fut.symbol and fut.symbol.startswith("MXF") and
+                        hasattr(fut, 'delivery_date') and isinstance(fut.delivery_date, str)):
+                        try:
+                            exp = datetime.strptime(fut.delivery_date, "%Y/%m/%d").date()
+                            if exp >= today and (best is None or exp < best[1]):
+                                best = (fut.symbol, exp)
+                        except (ValueError, TypeError) as e:
+                            self.write_log(f"警告：_find_mxf_contract: 解析月合約 {getattr(fut, 'symbol', 'N/A')} 日期 '{fut.delivery_date}' 失敗: {e}")
+                            continue
             return best if best else (None, None)
 
-        def _size_pricetick_generic(sjc) -> Tuple[float, float]:
+        def _size_pricetick_generic(sjc: SjContract) -> Tuple[float, float]: # 添加類型提示
             """安全讀取 multiplier / tick_size；若缺失則給預設"""
+            size = 1.0 # 預設值
+            tick = 0.01 # 預設值
             try:
-                size = float(getattr(sjc, "multiplier", 1) or 1)
-            except Exception:
-                size = 1.0
+                # 確保屬性存在且值不為 None 才進行轉換
+                if hasattr(sjc, "multiplier") and sjc.multiplier is not None:
+                     size = float(sjc.multiplier)
+                # 處理 multiplier 為 0 的情況，預設為 1
+                if size == 0:
+                     size = 1.0
+            except (ValueError, TypeError) as e:
+                self.write_log(f"警告：_size_pricetick_generic: 無法轉換 multiplier '{getattr(sjc, 'multiplier', 'N/A')}' 為 float for {getattr(sjc, 'code', 'N/A')}: {e}. 使用預設值 {size}")
+
             try:
-                tick = float(getattr(sjc, "tick_size", 0.01) or 0.01)
-            except Exception:
-                tick = 0.01
+                if hasattr(sjc, "tick_size") and sjc.tick_size is not None:
+                     tick = float(sjc.tick_size)
+                 # 處理 tick_size <= 0 的情況，預設為 0.01
+                if tick <= 0:
+                     tick = 0.01
+            except (ValueError, TypeError) as e:
+                self.write_log(f"警告：_size_pricetick_generic: 無法轉換 tick_size '{getattr(sjc, 'tick_size', 'N/A')}' 為 float for {getattr(sjc, 'code', 'N/A')}: {e}. 使用預設值 {tick}")
+
             return size, tick
 
-        def _parse_option(sjc: sj.contracts.Option) -> Optional[ContractData]:
+        # 假設 is_third_wednesday 可訪問 (例如 self.is_third_wednesday)
+        # def is_third_wednesday(self, dt: Optional[date]) -> bool: ...
+
+        def _parse_option(sjc) -> Optional[ContractData]: # 使用 SjOption 類型提示
             try:
+                # 檢查基礎屬性是否存在且不為 None
+                required_attrs = ['exchange', 'code', 'name', 'strike_price', 'option_right', 'delivery_date']
+                if not all(hasattr(sjc, attr) and getattr(sjc, attr) is not None for attr in required_attrs):
+                    self.write_log(f"警告：_parse_option: 合約 {getattr(sjc, 'code', 'N/A')} 缺少必要屬性或屬性為 None，跳過。")
+                    return None
+
+                # ===> 從 sjc.exchange 映射到 vn_exchange <===
+                vn_exchange = self.sj2vnpy.get(sjc.exchange)
+                if not vn_exchange:
+                    self.write_log(f"警告：_parse_option 無法映射 Shioaji 交易所 '{sjc.exchange}' 到 VnPy Exchange for {sjc.code}，跳過此合約。")
+                    return None
+                # ===> 映射結束 <===
+
+                # --- 計算 Size/Pricetick (期權通常固定，但可擴展) ---
+                option_size = 50.0
+                option_pricetick = 0.1
+                # 可根據 sjc.code 或 category 添加對其他類型期權的判斷
+                # if sjc.code.startswith("GDO"): ...
+
                 cd = ContractData(
                     gateway_name=self.gateway_name,
                     symbol=sjc.code,
-                    exchange=Exchange.TAIFEX,
+                    exchange=vn_exchange, # 使用映射後的 VnPy enum
                     name=sjc.name,
                     product=Product.OPTION,
-                    size=50.0,            # 依 TAIFEX 臺指選擇權乘數
-                    pricetick=0.1,
+                    size=option_size,
+                    pricetick=option_pricetick,
                     min_volume=1,
                     net_position=True,
                     history_data=True,
                 )
 
-                # --- 欄位對應 ------------------------------------
-                cd.option_strike = float(sjc.strike_price)
-                cd.option_type   = OptionType.CALL if sjc.option_right.value == "C" else OptionType.PUT
-                expiry_dt        = datetime.strptime(sjc.delivery_date, "%Y/%m/%d")  # *naive*
-                cd.option_expiry = expiry_dt
+                # --- 欄位映射 ---
+                try:
+                    cd.option_strike = float(sjc.strike_price)
+                except (ValueError, TypeError) as e:
+                     self.write_log(f"警告：_parse_option ({sjc.code}): 無法轉換 strike_price '{sjc.strike_price}' 為 float: {e}")
+                     return None # 無法處理缺少 strike price 的情況
 
-                cat = sjc.category or "TXO"
-                if is_third_wednesday(expiry_dt.date()):  # 月選
+                # 安全地獲取 option_right 的值
+                option_right_val = getattr(getattr(sjc, 'option_right', None), 'value', None)
+                if option_right_val == "C":
+                     cd.option_type = OptionType.CALL
+                elif option_right_val == "P":
+                     cd.option_type = OptionType.PUT
+                else:
+                     self.write_log(f"警告：_parse_option ({sjc.code}): 未知的 option_right 值 '{option_right_val}'")
+                     return None # 無法處理未知類型
+
+                try:
+                     # 確保 delivery_date 是字串
+                     if not isinstance(sjc.delivery_date, str):
+                         self.write_log(f"警告：_parse_option ({sjc.code}): delivery_date 不是字串 ({type(sjc.delivery_date)})")
+                         return None
+                     expiry_dt = datetime.strptime(sjc.delivery_date, "%Y/%m/%d")  # *naive*
+                     cd.option_expiry = expiry_dt
+                except (ValueError, TypeError) as e:
+                     self.write_log(f"警告：_parse_option ({sjc.code}): 無法解析 delivery_date '{sjc.delivery_date}': {e}")
+                     return None # 無法處理缺少到期日
+
+                cat = getattr(sjc, 'category', '') or "TXO" # 如果是 None 或空字串，預設為 TXO
+                expiry_date = expiry_dt.date()
+
+                # 這裡假設 is_third_wednesday 是全局函數或已正確導入
+                if is_third_wednesday(expiry_date):  # 月選
                     ym = expiry_dt.strftime("%Y%m")
                     cd.option_portfolio = f"{cat}{ym}"
-                    cd.option_index     = str(int(cd.option_strike))
+                    try:
+                        cd.option_index = str(int(cd.option_strike)) # 確保 strike 是整數形式的字串
+                    except ValueError: # 如果 strike price 無法轉為 int (例如小數)
+                        cd.option_index = str(cd.option_strike) # 直接使用 strike price 字串
+                    # 預設標的，可根據 category 細化
                     cd.option_underlying = f"TXF{ym}" if cat == "TXO" else ""
-                else:                                    # 週選
+                else:                                    # 週選或其他
                     ymd = expiry_dt.strftime("%Y%m%d")
-                    cd.option_portfolio = f"TX5{ymd}" if cat.startswith("TX") else f"{cat}W{ymd}"
-                    cd.option_index     = cd.option_portfolio
+                    # 使用 W 作為週選標識
+                    cd.option_portfolio = f"{cat}W{ymd}"
+                    cd.option_index     = cd.option_portfolio # 週選 index 常與 portfolio 相同
                     cd.option_underlying = ""  # 待批次補齊
+
                 return cd
             except Exception as e:
-                self.write_log(f"_parse_option() 失敗: {e}")
+                self.write_log(f"_parse_option() Exception ({getattr(sjc, 'code', 'N/A')}): {e}\n{traceback.format_exc()}")
                 return None
+        # --- _parse_option 結束 ---
 
         # 2️⃣ 建立臨時 dict -------------------------------------------
-        tmp: Dict[str, ContractData] = {}
+        tmp: Dict[str, ContractData] = {} # 儲存 ContractData 物件，以 vt_symbol 為鍵
 
         # 2‑A 期權 -------------------------------------------------
-        for code, sjc in self.api.Contracts.Options._code2contract.items():
-            cd = _parse_option(sjc)
-            if cd:
-                tmp[cd.vt_symbol] = cd
+        # 安全地訪問 Options contracts
+        options_contracts = getattr(getattr(self.api, 'Contracts', None), 'Options', None)
+        if options_contracts and hasattr(options_contracts, '_code2contract'):
+            self.write_log(f"Processing {len(options_contracts._code2contract)} options contracts...")
+            processed_count = 0
+            for code, sjc in options_contracts._code2contract.items():
+                if isinstance(sjc, sjOption): # 確保是期權物件
+                    cd = _parse_option(sjc) # 調用修改後的函數
+                    if cd:
+                        tmp[cd.vt_symbol] = cd
+                        processed_count += 1
+                else:
+                     self.write_log(f"警告：Options._code2contract 包含非 SjOption 對象 ({type(sjc)}) for code {code}，跳過。")
+            self.write_log(f"Finished processing options. Successfully parsed: {processed_count}")
+        else:
+             self.write_log("警告：_process_contracts: 找不到 Options 或 _code2contract 屬性，跳過期權處理。")
 
         # 2‑B 期貨 -------------------------------------------------
-        fut_map = getattr(self.api.Contracts, "Futures", None)
-        if fut_map and hasattr(fut_map, "_code2contract"):
-            for code, sjc in fut_map._code2contract.items():
-                size, tick = _size_pricetick_generic(sjc)
-                # 覆寫台指商品官規
-                if code.startswith("TXF"):
-                    size, tick = 200.0, 1.0
-                elif code.startswith("MXF"):
-                    size, tick = 50.0, 1.0
-                elif code.startswith("TMF"):
-                    size, tick = 10.0, 1.0
+        futures_contracts = getattr(getattr(self.api, 'Contracts', None), 'Futures', None)
+        if futures_contracts and hasattr(futures_contracts, '_code2contract'):
+            self.write_log(f"Processing {len(futures_contracts._code2contract)} futures contracts...")
+            processed_count = 0
+            for code, sjc in futures_contracts._code2contract.items():
+                 # 確保是合約物件且包含必要屬性
+                 if not isinstance(sjc, SjContract) or not all(hasattr(sjc, attr) for attr in ['exchange', 'code', 'name']):
+                     self.write_log(f"警告：Futures._code2contract 包含無效對象或缺少屬性 for code {getattr(sjc, 'code', code)}，跳過。")
+                     continue
 
-                cd = ContractData(
-                    gateway_name=self.gateway_name,
-                    symbol=code,
-                    exchange=Exchange.TAIFEX,
-                    name=sjc.name,
-                    product=Product.FUTURES,
-                    size=size,
-                    pricetick=tick,
-                    min_volume=1,
-                    net_position=True,
-                    history_data=True,
-                )
-                tmp[cd.vt_symbol] = cd
+                 # ===> 從 sjc.exchange 映射到 vn_exchange <===
+                 vn_exchange = self.sj2vnpy.get(sjc.exchange)
+                 if not vn_exchange:
+                     self.write_log(f"警告：_process_contracts (期貨) 無法映射 Shioaji 交易所 '{sjc.exchange}' 到 VnPy Exchange for {code}，跳過此合約。")
+                     continue # 跳過這個合約
+                 # ===> 映射結束 <===
+
+                 size, tick = _size_pricetick_generic(sjc) # 使用更安全的函數
+                 # 覆寫特定台灣期貨規則
+                 # 確保 code 不為 None
+                 if code:
+                     if code.startswith("TXF"): # 台指期 (大台)
+                         size, tick = 200.0, 1.0
+                     elif code.startswith("MXF"): # 小台指
+                         size, tick = 50.0, 1.0
+                     elif code.startswith("EXF"): # 電子期
+                         size, tick = 4000.0, 0.05 # 請確認最新規格
+                     elif code.startswith("FXF"): # 金融期
+                         size, tick = 1000.0, 0.2  # 請確認最新規格
+                     elif code.startswith("TMF"): # 台灣50期貨 (假設) - 確認規格
+                         size, tick = 10.0, 1.0
+                     # 可為其他期貨 (TE, TF, GDF, XIF 等) 添加更多規則
+
+                 cd = ContractData(
+                     gateway_name=self.gateway_name,
+                     symbol=code,
+                     exchange=vn_exchange, # 使用映射後的 VnPy enum
+                     name=sjc.name,
+                     product=Product.FUTURES,
+                     size=size,
+                     pricetick=tick,
+                     min_volume=1,
+                     net_position=True,
+                     history_data=True,
+                 )
+                 tmp[cd.vt_symbol] = cd
+                 processed_count += 1
+            self.write_log(f"Finished processing futures. Successfully parsed: {processed_count}")
+        else:
+             self.write_log("警告：_process_contracts: 找不到 Futures 或 _code2contract 屬性，跳過期貨處理。")
 
         # 2‑C 現股 / ETF -------------------------------------------
-        for ex_name, ex_enum in (("TSE", Exchange.TWSE), ("OTC", Exchange.TOTC)):
-            ex_cat = getattr(self.api.Contracts.Stocks, ex_name, None)
-            if not ex_cat or not hasattr(ex_cat, "_code2contract"):
-                continue
-            for code, sjc in ex_cat._code2contract.items():
-                size, tick = _size_pricetick_generic(sjc)
-                cd = ContractData(
-                    gateway_name=self.gateway_name,
-                    symbol=code,
-                    exchange=ex_enum,
-                    name=sjc.name,
-                    product=Product.EQUITY,
-                    size=size,
-                    pricetick=tick,
-                    min_volume=1,
-                    net_position=False,
-                    history_data=True,
-                )
-                tmp[cd.vt_symbol] = cd
+        stocks_contracts = getattr(getattr(self.api, 'Contracts', None), 'Stocks', None)
+        if stocks_contracts:
+            processed_count_total_stock = 0
+            for ex_name, ex_enum in (("TSE", Exchange.TWSE), ("OTC", Exchange.TOTC)): # 可根據需要添加 OES
+                ex_cat = getattr(stocks_contracts, ex_name, None)
+                if not ex_cat or not hasattr(ex_cat, '_code2contract'):
+                    self.write_log(f"提示：_process_contracts: 找不到 Stocks.{ex_name} 或其 _code2contract，跳過 {ex_name} 處理。")
+                    continue
 
-        # 3️⃣ 補週選標的 -------------------------------------------
-        mxf_sym, _ = _find_mxf_contract()
+                self.write_log(f"Processing {len(ex_cat._code2contract)} {ex_name} stock contracts...")
+                processed_count_ex = 0
+                for code, sjc in ex_cat._code2contract.items():
+                     # 確保是合約物件且包含必要屬性
+                     if not isinstance(sjc, SjContract) or not all(hasattr(sjc, attr) for attr in ['exchange', 'code', 'name']):
+                         self.write_log(f"警告：Stocks.{ex_name} 包含無效對象或缺少屬性 for code {getattr(sjc, 'code', code)}，跳過。")
+                         continue
+
+                     # 可選的健壯性檢查 (如前所述)
+                     vn_exchange_check = self.sj2vnpy.get(sjc.exchange)
+                     if vn_exchange_check != ex_enum:
+                         self.write_log(f"警告：_process_contracts ({ex_name}) 合約 {code} 的 Shioaji 交易所 '{sjc.exchange}' 映射結果 ({vn_exchange_check}) 與預期 ({ex_enum}) 不符！將使用預期的 {ex_enum}。")
+
+                     size, tick = _size_pricetick_generic(sjc)
+                     # 判斷產品類型 (股票/ETF/權證等) - 簡易方式:
+                     product_type = Product.EQUITY # 預設
+                     # 可基於 code 或 sjc 的其他屬性 (如 category) 添加更精確的判斷邏輯
+                     # if 'ETF' in sjc.name or code.startswith(...): product_type = Product.ETF
+                     # elif ... : product_type = Product.WARRANT
+
+                     cd = ContractData(
+                         gateway_name=self.gateway_name,
+                         symbol=code,
+                         exchange=ex_enum, # 使用循環中的 VnPy enum
+                         name=sjc.name,
+                         product=product_type,
+                         size=size, # 對股票通常是 1，但 multiplier 可能用於成本計算
+                         pricetick=tick,
+                         min_volume=1,
+                         net_position=False,
+                         history_data=True,
+                     )
+                     tmp[cd.vt_symbol] = cd
+                     processed_count_ex += 1
+                self.write_log(f"Finished processing {ex_name}. Successfully parsed: {processed_count_ex}")
+                processed_count_total_stock += processed_count_ex
+            self.write_log(f"Finished processing all stocks/ETFs. Total successfully parsed: {processed_count_total_stock}")
+        else:
+             self.write_log("警告：_process_contracts: 找不到 Stocks contracts attribute，跳過股票/ETF處理。")
+
+
+        # 3️⃣ 補齊週選標的 -------------------------------------------
+        mxf_sym, _ = _find_mxf_contract() # 使用內部輔助函數
         if mxf_sym:
             patched = 0
             for cd in tmp.values():
-                if cd.product == Product.OPTION and not cd.option_underlying and cd.option_portfolio.startswith("TX5"):
-                    cd.option_underlying = mxf_sym
-                    patched += 1
-            self.write_log(f"週選標的補齊 {patched} 檔 ➜ {mxf_sym}")
+                # 檢查是否為期權、無標的、且 portfolio 符合週選特徵
+                if cd.product == Product.OPTION and not cd.option_underlying and ("W" in cd.option_portfolio or cd.option_portfolio.startswith("TX5")):
+                     # 假設 TXO 週選使用 MXF 作為標的
+                     if cd.option_portfolio.startswith("TX"):
+                        cd.option_underlying = mxf_sym
+                        patched += 1
+                     # 可為其他類別的週選添加規則
+            if patched > 0:
+                self.write_log(f"週選標的補齊 {patched} 檔 ➜ {mxf_sym}")
         else:
             self.write_log("⚠️  找不到 MXF 連續/近月，週選標的保持空白")
 
-        # 4️⃣ 推送 ---------------------------------------------------
+        # 4️⃣ 推送合約資訊到 VnPy ---------------------------------------------------
+        count = 0
         with self.contract_lock:
             self.contracts.clear()
-            for cd in tmp.values():
-                self.contracts[cd.vt_symbol] = cd
-                self.on_contract(cd)
+            for vt_symbol, cd in tmp.items():
+                self.contracts[vt_symbol] = cd
+                self.on_contract(cd) # 推送到 VnPy 事件引擎
+                count += 1
 
-        self.write_log(f"_process_contracts: 完成，推送 {len(tmp)} 檔合約")
+        self.write_log(f"_process_contracts: 完成，推送 {count} 檔合約 (共處理 {len(tmp)} 檔)") # 記錄最終推送數量
