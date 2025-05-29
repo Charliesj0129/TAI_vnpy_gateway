@@ -240,7 +240,7 @@ class ShioajiGateway(BaseGateway):
         "CA密碼": "",
         "身分證字號": "", # Shioaji 0.3.6+ activate_ca 需要 person_id
         "simulation": False,
-        "下載合約": False,
+        "下載合約": True,
         "重連次數": 3,
         "重連間隔(秒)": 5
     }
@@ -897,7 +897,7 @@ class ShioajiGateway(BaseGateway):
                     contracts_fetched_successfully = True # 標記成功
                 elif status_after_fetch == SjFetchStatus.Fetching:
                     self.write_log("警告：_connect_worker: Contract status is still Fetching.")
-                elif status_after_fetch == SjFetchStatus.NotFetched:
+                elif status_after_fetch == SjFetchStatus.Unfetch:
                     self.write_log("錯誤：_connect_worker: Contract status is NotFetched. Subsequent lookups will likely fail.") # <--- 重要錯誤
                 else:
                     self.write_log(f"警告/錯誤：_connect_worker: Contract status is unexpected: {status_after_fetch}")

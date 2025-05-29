@@ -51,3 +51,17 @@
 [E 2025-04-30 13:31:29,919 C:\Users\charl\vnpy_inter_shioaji\.venv\Lib\site-packages\shioaji\shioaji.py:231:_setup_solace] RequestException URLError(TimeoutError('timed out'))
 [E 2025-04-30 13:31:35,429 C:\Users\charl\vnpy_inter_shioaji\.venv\Lib\site-packages\shioaji\shioaji.py:231:_setup_solace] RequestException URLError(TimeoutError('timed out'))
 [E 2025-04-30 13:31:40,952 C:\Users\charl\vnpy_inter_shioaji\.venv\Lib\site-packages\shioaji\shioaji.py:231:_setup_solace] RequestException URLError(TimeoutError('timed out'))
+[E 2025-05-03 03:31:07,359 C:\Users\charl\vnpy_inter_shioaji\.venv\Lib\site-packages\shioaji\shioaji.py:231:_setup_solace] RequestException URLError(gaierror(11001, 'getaddrinfo failed'))
+[E 2025-05-03 03:31:07,863 C:\Users\charl\vnpy_inter_shioaji\.venv\Lib\site-packages\shioaji\shioaji.py:231:_setup_solace] RequestException URLError(gaierror(11001, 'getaddrinfo failed'))
+[E 2025-05-03 03:31:08,364 C:\Users\charl\vnpy_inter_shioaji\.venv\Lib\site-packages\shioaji\shioaji.py:231:_setup_solace] RequestException URLError(gaierror(11001, 'getaddrinfo failed'))
+[E 2025-05-03 03:31:08,865 C:\Users\charl\vnpy_inter_shioaji\.venv\Lib\site-packages\shioaji\shioaji.py:231:_setup_solace] RequestException URLError(gaierror(11001, 'getaddrinfo failed'))
+[E 2025-05-03 03:31:09,367 C:\Users\charl\vnpy_inter_shioaji\.venv\Lib\site-packages\shioaji\shioaji.py:231:_setup_solace] RequestException URLError(gaierror(11001, 'getaddrinfo failed'))
+[E 2025-05-03 03:31:09,868 C:\Users\charl\vnpy_inter_shioaji\.venv\Lib\site-packages\shioaji\shioaji.py:231:_setup_solace] RequestException URLError(gaierror(11001, 'getaddrinfo failed'))
+[E 2025-05-06 12:41:02,326 C:\Users\charl\vnpy_inter_shioaji\.venv\Lib\site-packages\shioaji\shioaji.py:423:place_order] {'status': {'status_code': 406}, 'response': {'detail': 'Order price error.'}}
+[E 2025-05-06 12:41:05,681 C:\Users\charl\vnpy_inter_shioaji\.venv\Lib\site-packages\shioaji\shioaji.py:423:place_order] {'status': {'status_code': 406}, 'response': {'detail': 'Order price error.'}}
+[E 2025-05-10 18:26:17,058 C:\Users\charl\vnpy_inter_shioaji\.venv\Lib\site-packages\shioaji\shioaji.py:231:_setup_solace] RequestException URLError(gaierror(11001, 'getaddrinfo failed'))
+[E 2025-05-10 18:26:17,560 C:\Users\charl\vnpy_inter_shioaji\.venv\Lib\site-packages\shioaji\shioaji.py:231:_setup_solace] RequestException URLError(gaierror(11001, 'getaddrinfo failed'))
+[E 2025-05-10 18:26:18,062 C:\Users\charl\vnpy_inter_shioaji\.venv\Lib\site-packages\shioaji\shioaji.py:231:_setup_solace] RequestException URLError(gaierror(11001, 'getaddrinfo failed'))
+[E 2025-05-10 18:26:18,563 C:\Users\charl\vnpy_inter_shioaji\.venv\Lib\site-packages\shioaji\shioaji.py:231:_setup_solace] RequestException URLError(gaierror(11001, 'getaddrinfo failed'))
+[E 2025-05-10 18:26:19,065 C:\Users\charl\vnpy_inter_shioaji\.venv\Lib\site-packages\shioaji\shioaji.py:231:_setup_solace] RequestException URLError(gaierror(11001, 'getaddrinfo failed'))
+[E 2025-05-10 18:26:19,567 C:\Users\charl\vnpy_inter_shioaji\.venv\Lib\site-packages\shioaji\shioaji.py:231:_setup_solace] RequestException URLError(gaierror(11001, 'getaddrinfo failed'))
