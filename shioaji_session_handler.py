@@ -18,6 +18,8 @@ import janus # Janus is used by the class for async queue handling
 
 # --- VnPy 相關導入 ---
 # from vnpy.event import EventEngine,Event # EventEngine not directly used by handler, Event used by class methods
+
+from vnpy.trader.event import EVENT_CONTRACT
 from vnpy.trader.gateway import BaseGateway # Imported for class inheritance
 from vnpy.trader.object import (
     TickData, OrderData, TradeData, PositionData, AccountData, ContractData, 
@@ -135,6 +137,7 @@ FUTURES_OFFSET_MAP: Dict[Offset, SjFuturesOCType] = {
 EVENT_SUBSCRIBE_SUCCESS = "eSubscribeSuccess"
 EVENT_SUBSCRIBE_FAILED  = "eSubscribeFailed"
 EVENT_RECONNECT_FAILED = "eReconnectFailed"
+EVENT_CONTRACTS_LOADED = "eContractsLoaded"
 
 # --- 模組級別輔助函數 (根據您的建議和原有程式碼) ---
 
@@ -819,16 +822,9 @@ class ShioajiSessionHandler(BaseGateway):
         self.connect_thread.daemon = True
         self.connect_thread.start()
 
-    def _connect_worker(self, setting: dict) -> None: # 'setting' is self.session_setting
-        """
-        (Worker Thread) Handles the actual Shioaji API connection, login,
-        contract fetching, CA activation, and callback setup for this session handler.
-        """
-        # Reset reconnect attempts at the start of a new connection attempt
-        self.reconnect_attempts = 0 
-        # login_result processing variables
+    def _connect_worker(self, setting: dict) -> None:
+        self.reconnect_attempts = 0
         raw_accounts_data: Any = None
-        # contract_download_flag_from_login: bool = False # From Shioaji login, might not be used if we manage fetch manually
         logged_in_person_id: Optional[str] = None
 
         self.write_log(
@@ -836,200 +832,176 @@ class ShioajiSessionHandler(BaseGateway):
             f"Simulation: {self.simulation}"
         )
         try:
-            # APIKey, SecretKey, etc., are already set as instance attributes 
-            # (self.api_key, self.secret_key) in the connect() method
-            # from the 'setting' (session_setting) dictionary.
-
             if not self.api_key or not self.secret_key:
                 self.write_log(f"Handler {self.gateway_name}: Missing APIKey or SecretKey. Connection aborted.", level="error")
-                self._handle_disconnect() # Ensure cleanup and notify manager if applicable
+                self._handle_disconnect()
                 return
-            
+
             self.api = sj.Shioaji(simulation=self.simulation)
             self.write_log(f"Handler {self.gateway_name}: Shioaji API instance created (sim={self.simulation}).")
-            
-            # Perform login
+
             self.write_log(f"Handler {self.gateway_name}: Attempting Shioaji API login...")
             login_result = self.api.login(
                 api_key=self.api_key,
                 secret_key=self.secret_key,
-                fetch_contract=False,       # We will manually control/check contract fetching
-                subscribe_trade=True,       # Subscribe to order/deal updates for this session
-                contracts_timeout=0         # Makes login non-blocking regarding contracts
+                fetch_contract=False,
+                subscribe_trade=True,
+                contracts_timeout=0
             )
             self.write_log(f"Handler {self.gateway_name}: Shioaji API login call completed.")
 
-            # Process login_result (Shioaji v1.0+ returns a tuple)
-            # Based on Shioaji docs, login can return:
-            # - (list_of_accounts, bool_contracts_downloaded_by_login, str_person_id)
-            # - Or just list_of_accounts if older or an error occurred.
             if isinstance(login_result, tuple) and len(login_result) >= 1:
                 raw_accounts_data = login_result[0]
-                if len(login_result) >= 3: # Modern Shioaji
-                    # contract_download_flag_from_login = login_result[1] # We may not use this directly
+                if len(login_result) >= 3:
                     logged_in_person_id = login_result[2]
-            elif isinstance(login_result, list): # Fallback for older Shioaji or simpler return
+            elif isinstance(login_result, list):
                 raw_accounts_data = login_result
-            else: # Unexpected login result
+            else:
                  self.write_log(f"Handler {self.gateway_name}: Unexpected login result type: {type(login_result)}. Result: {login_result}", level="error")
                  self._handle_disconnect()
                  return
-            
             self.write_log(f"Handler {self.gateway_name}: Logged in Person ID from API: {logged_in_person_id}")
 
-            # Standardize and set default Shioaji accounts for this API instance
             accounts_list: List[Union[SjAccount, SjStockAccount, SjFutureAccount]] = []
             if isinstance(raw_accounts_data, list):
                 accounts_list = raw_accounts_data
-            elif isinstance(raw_accounts_data, (SjAccount, SjStockAccount, SjFutureAccount)): # Single account object
+            elif isinstance(raw_accounts_data, (SjAccount, SjStockAccount, SjFutureAccount)):
                 accounts_list = [raw_accounts_data]
-            
+
             if not accounts_list:
                 self.write_log(f"Handler {self.gateway_name}: No accounts returned from Shioaji login.", level="warning")
             else:
                 self.write_log(f"Handler {self.gateway_name}: Received {len(accounts_list)} account(s) from Shioaji.")
                 stock_default_set = False
                 future_default_set = False
-                # Explicitly set based on the primary vnpy_account_id this handler is for, if possible,
-                # or fall back to first available. For now, using first available of each type.
                 for acc_obj in accounts_list:
                     if not hasattr(acc_obj, 'account_type') or not hasattr(acc_obj, 'account_id'):
                         self.write_log(f"Handler {self.gateway_name}: Invalid account object in list: {acc_obj}", level="warning")
                         continue
-
                     if acc_obj.account_type == SjAccountType.Stock and not stock_default_set:
                         self.api.set_default_account(acc_obj)
                         stock_default_set = True
-                        self.write_log(f"Handler {self.gateway_name}: Default Shioaji Stock Account set to: {acc_obj.account_id}")
                     elif acc_obj.account_type == SjAccountType.Future and not future_default_set:
                         self.api.set_default_account(acc_obj)
                         future_default_set = True
-                        self.write_log(f"Handler {self.gateway_name}: Default Shioaji FutOpt Account set to: {acc_obj.account_id}")
-                    if stock_default_set and future_default_set:
-                        break
+                    if stock_default_set and future_default_set: break
                 if not self.api.stock_account and not self.api.futopt_account:
                      self.write_log(f"Handler {self.gateway_name}: Failed to set any default Shioaji accounts.", level="warning")
 
-
-            # --- Contract Fetching and Processing ---
-            self.write_log(f"Handler {self.gateway_name}: Preparing to fetch/process contracts (force_download={self.force_download}).")
-            
-            # Reset contract fetching state for this attempt (important for reconnections)
+            self.write_log(f"Handler {self.gateway_name}: 準備獲取/處理合約 (force_download={self.force_download}).")
             self._all_contracts_fetched_event.clear()
             self.fetched_security_types.clear()
-            with self._processing_contracts_lock:
-                self._contracts_processed_flag = False
-
+            with self._processing_contracts_lock: self._contracts_processed_flag = False
             initial_contracts_status = getattr(getattr(self.api, 'Contracts', None), 'status', SjFetchStatus.Unfetch)
-            needs_explicit_fetch_call = False
-            if self.force_download or initial_contracts_status != SjFetchStatus.Fetched:
-                needs_explicit_fetch_call = True
-            
+            needs_explicit_fetch_call = self.force_download or initial_contracts_status != SjFetchStatus.Fetched
             if needs_explicit_fetch_call:
-                self.write_log(f"Handler {self.gateway_name}: Calling self.api.fetch_contracts() (non-blocking)...")
+                self.write_log(f"Handler {self.gateway_name}: 呼叫 self.api.fetch_contracts() (非阻塞)...")
                 try:
-                    self.api.fetch_contracts(
-                        contract_download=True, # Ensure download is attempted
-                        contracts_timeout=0,    # Makes fetch_contracts call non-blocking
-                        contracts_cb=self._contracts_cb
-                    )
+                    self.api.fetch_contracts(contract_download=True, contracts_timeout=0, contracts_cb=self._contracts_cb)
                 except Exception as e_fetch_call:
-                    self.write_log(f"Handler {self.gateway_name}: Error calling api.fetch_contracts(): {e_fetch_call}", level="error")
-                    self._handle_disconnect() 
-                    return
-            else: # Contracts already Fetched and not forcing download
-                self.write_log(f"Handler {self.gateway_name}: Contracts status is already {initial_contracts_status}, not forcing download. Signaling ready for processing.")
-                self._all_contracts_fetched_event.set() # Signal that we can proceed to check/process
-
-            # Wait for all _contracts_cb to signal completion or timeout
-            contracts_cb_timeout = float(self.session_setting.get("contracts_cb_timeout_sec", 60.0)) # Default 60s
-            self.write_log(f"Handler {self.gateway_name}: Waiting for contract download callbacks (max {contracts_cb_timeout}s)...")
-            
+                    self.write_log(f"Handler {self.gateway_name}: 呼叫 api.fetch_contracts() 錯誤: {e_fetch_call}", level="error")
+                    self._handle_disconnect(); return
+            else:
+                self.write_log(f"Handler {self.gateway_name}: 合約狀態已為 {initial_contracts_status}，且未強制下載。發送已就緒信號。")
+                self._all_contracts_fetched_event.set()
+            contracts_cb_timeout = float(self.session_setting.get("contracts_cb_timeout_sec", 60.0))
+            self.write_log(f"Handler {self.gateway_name}: 等待合約下載回調 (最多 {contracts_cb_timeout}秒)...")
             all_callbacks_event_set = self._all_contracts_fetched_event.wait(timeout=contracts_cb_timeout)
-            
             current_contracts_status_after_wait = getattr(getattr(self.api, 'Contracts', None), 'status', 'N/A_Status')
-
-            if all_callbacks_event_set:
-                self.write_log(f"Handler {self.gateway_name}: Contract callbacks event was set. Contracts status: {current_contracts_status_after_wait}")
-            else: # Timeout occurred waiting for _all_contracts_fetched_event
-                self.write_log(
-                    f"Handler {self.gateway_name}: Timeout ({contracts_cb_timeout}s) waiting for all contract callbacks. "
-                    f"Contracts status: {current_contracts_status_after_wait}", 
-                    level="warning"
-                )
-
-            # Attempt to process contracts
+            if all_callbacks_event_set: self.write_log(f"Handler {self.gateway_name}: 合約回調事件已設置。合約狀態: {current_contracts_status_after_wait}")
+            else: self.write_log(f"Handler {self.gateway_name}: 等待所有合約回調超時 ({contracts_cb_timeout}秒)。合約狀態: {current_contracts_status_after_wait}", level="warning")
             with self._processing_contracts_lock:
                 if not self._contracts_processed_flag:
-                    # Process if status is Fetched OR if all callbacks were received (even if status might not have updated due to timing)
                     if (hasattr(self.api, 'Contracts') and self.api.Contracts.status == SjFetchStatus.Fetched) or \
                        (all_callbacks_event_set and self.fetched_security_types.issuperset(self.expected_security_types)):
-                        
-                        if self.api.Contracts.status != SjFetchStatus.Fetched and all_callbacks_event_set:
-                            self.write_log(f"Handler {self.gateway_name}: All callbacks received, but Contracts.status is {self.api.Contracts.status}. Proceeding to process anyway.", level="info")
-                        
-                        self.write_log(f"Handler {self.gateway_name}: Calling _process_contracts().")
-                        self._process_contracts() # This will call self.on_contract for each
+                        if hasattr(self.api, 'Contracts') and self.api.Contracts.status != SjFetchStatus.Fetched and all_callbacks_event_set:
+                            self.write_log(f"Handler {self.gateway_name}: 所有回調已收到，但 Contracts.status 為 {self.api.Contracts.status}。仍嘗試處理。", level="info")
+                        self.write_log(f"Handler {self.gateway_name}: 呼叫 _process_contracts()。")
+                        self._process_contracts()
                         self._contracts_processed_flag = True
+                        self.on_event(EVENT_CONTRACTS_LOADED, {"vnpy_account_id": self.vnpy_account_id, "status": "success"})
                     else:
-                        self.write_log(
-                            f"Handler {self.gateway_name}: Contracts not processed. Final Status: {current_contracts_status_after_wait}. "
-                            f"Callbacks received for all expected types: {all_callbacks_event_set and self.fetched_security_types.issuperset(self.expected_security_types)}.",
-                            level="error"
-                        )
-            # --- End Contract Fetching ---
+                        self.write_log(f"Handler {self.gateway_name}: 合約未處理。最終狀態: {current_contracts_status_after_wait}。所有預期類型回調是否收到: {all_callbacks_event_set and self.fetched_security_types.issuperset(self.expected_security_types)}。", level="error")
+                        self.on_event(EVENT_CONTRACTS_LOADED, {"vnpy_account_id": self.vnpy_account_id, "status": "failed"})
 
-            # CA Activation
-            # Use person_id_setting from self.session_setting, or logged_in_person_id if available from API
             person_id_for_ca = self.person_id_setting or logged_in_person_id
             if not self.simulation and self.ca_path and self.ca_passwd and person_id_for_ca:
                 self.write_log(f"Handler {self.gateway_name}: Attempting CA activation for Person ID: {person_id_for_ca}...")
                 try:
-                    self.api.activate_ca(
-                        ca_path=self.ca_path,
-                        ca_passwd=self.ca_passwd,
-                        person_id=person_id_for_ca 
-                    )
+                    self.api.activate_ca(ca_path=self.ca_path, ca_passwd=self.ca_passwd, person_id=person_id_for_ca)
                     self.write_log(f"Handler {self.gateway_name}: CA activation successful for {person_id_for_ca}.")
-                    # Optionally re-check account signed status here if needed
                 except Exception as e_ca:
                     self.write_log(f"Handler {self.gateway_name}: CA activation failed for {person_id_for_ca}: {e_ca}", level="warning")
-            elif not self.simulation:
-                self.write_log(f"Handler {self.gateway_name}: CA path, password, or Person ID not fully provided for CA activation. Skipping.", level="info")
-            else: # Simulation mode
-                 self.write_log(f"Handler {self.gateway_name}: Simulation mode, skipping CA activation.", level="info")
+            elif not self.simulation: self.write_log(f"Handler {self.gateway_name}: CA path, password, or Person ID not fully provided for CA activation. Skipping.", level="info")
+            else: self.write_log(f"Handler {self.gateway_name}: Simulation mode, skipping CA activation.", level="info")
 
-            # Set Shioaji callbacks
             self._set_callbacks()
 
-            # Finalize connection state
             self.connected = True
             self.logged_in = True
             self.write_log(
                 f"Handler {self.gateway_name} (Acc: {self.vnpy_account_id}) connection fully established."
             )
-            self.reconnect_attempts = 0 # Reset on successful connection
+            self.reconnect_attempts = 0
 
-            # Notify manager of successful connection
             self.manager_event_callback(
-                "session_status", 
-                {"status": "connected", "vnpy_account_id": self.vnpy_account_id, "gateway_name": self.gateway_name}, 
+                "session_status",
+                {"status": "connected", "vnpy_account_id": self.vnpy_account_id, "gateway_name": self.gateway_name},
                 self.vnpy_account_id
             )
+            self.query_all_handler_data()
+            # --- 新增：重新訂閱之前已訂閱的行情 ---
+            self.write_log(f"Handler {self.gateway_name}: Attempting to re-subscribe to previously subscribed symbols...")
+            # 創建一個 self.subscribed 的副本進行迭代，因為 self.subscribe 方法可能會修改 self.subscribed
+            symbols_to_resubscribe: Set[str]
+            with self.subscribed_lock:
+                symbols_to_resubscribe = self.subscribed.copy()
 
-            # Query initial data for this handler
-            self.query_all_handler_data() 
-            
+            if not symbols_to_resubscribe:
+                self.write_log(f"Handler {self.gateway_name}: No previously subscribed symbols to re-subscribe.")
+            else:
+                self.write_log(f"Handler {self.gateway_name}: Will attempt to re-subscribe to: {symbols_to_resubscribe}")
+                # 在重新訂閱前，先清空 Handler 內部的 self.subscribed 記錄，
+                # 讓 subscribe 方法能夠正確地重新加入成功的訂閱。
+                # 這是因為 subscribe 方法現在會無條件嘗試 API 調用。
+                with self.subscribed_lock:
+                    self.subscribed.clear()
+
+                for vt_symbol in symbols_to_resubscribe:
+                    try:
+                        symbol_code, exchange_value = vt_symbol.split(".")
+                        vn_exchange = Exchange(exchange_value)
+                        # 創建一個新的 SubscribeRequest 來調用 self.subscribe
+                        # 這確保了即使 Manager 沒有主動發起新的訂閱請求，Handler 也能恢復其狀態
+                        resub_req = SubscribeRequest(symbol=symbol_code, exchange=vn_exchange)
+                        self.write_log(f"Handler {self.gateway_name}: Re-subscribing to {vt_symbol}...")
+                        self.subscribe(resub_req) # 調用修改後的 subscribe 方法
+                    except ValueError:
+                        self.write_log(f"Handler {self.gateway_name}: 無法解析 vt_symbol '{vt_symbol}' 以進行重新訂閱。", level="error")
+                    except Exception as e_resub:
+                        self.write_log(f"Handler {self.gateway_name}: 重新訂閱 {vt_symbol} 時發生錯誤: {e_resub}", level="error")
+            # --- END 重新訂閱 ---
+
+            # 在所有操作完成後，最終通知 Manager 連接成功
+            self.manager_event_callback(
+                "session_status",
+                {"status": "connected", "vnpy_account_id": self.vnpy_account_id, "gateway_name": self.gateway_name},
+                self.vnpy_account_id
+            )
+            self.write_log(f"Handler {self.gateway_name} (Acc: {self.vnpy_account_id}) full connection and re-subscription process completed.")
+
+
+
         except SjTokenError as e_token:
             self.write_log(f"Handler {self.gateway_name}: Shioaji API login TokenError: {e_token}", level="critical")
-            self._handle_disconnect() # Triggers reconnect or signals failure
-        except ValueError as e_value: # Catch specific errors like the non-ascii for keys
+            self._handle_disconnect()
+        except ValueError as e_value:
              self.write_log(f"Handler {self.gateway_name}: ValueError during connection (check API keys for non-ASCII?): {e_value}\n{traceback.format_exc()}", level="critical")
              self._handle_disconnect()
         except Exception as e_outer:
             self.write_log(f"Handler {self.gateway_name}: Unhandled exception in connect worker: {e_outer}\n{traceback.format_exc()}", level="critical")
             self._handle_disconnect()
-
+            
     def close(self) -> None:
         self.write_log(f"Handler {self.gateway_name} (Acc: {self.vnpy_account_id}): Initiating close sequence...")
 
@@ -1337,29 +1309,23 @@ class ShioajiSessionHandler(BaseGateway):
 
     def _on_order_deal_shioaji(self, state: SjOrderState, message: dict) -> None:
         """
-        (Optimized) 處理 Shioaji API 推送的原始訂單/成交更新。
-        將原始的 state 和 message 放入 janus_queue 以便後續非同步處理。
+        (Callback from Shioaji SDK)
+        Puts raw order/deal updates onto the janus_queue for asynchronous processing.
         """
-        # 此方法由 Shioaji SDK 的執行緒調用，應盡可能快速返回。
-        # self.write_log(f"原始 Shioaji 訂單/成交更新: State={state.value}, Msg={message}", level="debug") # 高頻時日誌需謹慎
-
         try:
-            # 'process_order_deal' 作為任務類型標識符
-            event_tuple = ('process_order_deal', state, message) 
-            if self.loop.is_running(): # 確保 asyncio 迴圈正在運行
+            event_tuple = ('process_order_deal', state, message)
+            if self.loop.is_running():
                 self.loop.call_soon_threadsafe(self.janus_queue.sync_q.put_nowait, event_tuple)
             else:
                 self.write_log(
-                    f"Handler {self.gateway_name} 的 asyncio 迴圈未運行。無法將訂單/成交更新加入隊列。", 
+                    f"Handler {self.gateway_name} asyncio loop not running. Cannot queue order/deal update.",
                     level="warning"
                 )
         except Exception as e:
-            # 處理隊列已滿 (janus.Full) 或其他放入隊列時的錯誤
             self.write_log(
-                f"Handler {self.gateway_name}: 將 Shioaji 訂單/成交更新放入 janus_queue 時出錯: {e}", 
+                f"Handler {self.gateway_name}: Error putting Shioaji order/deal update to janus_queue: {e}",
                 level="error"
             )
-# Inside ShioajiSessionHandler class:
 
     def _process_single_order_deal_event(self, state: SjOrderState, message: dict) -> None:
         thread_name = threading.current_thread().name 
@@ -1580,184 +1546,222 @@ class ShioajiSessionHandler(BaseGateway):
 
     def _process_single_order_deal_event(self, state: SjOrderState, message: dict) -> None:
         """
-        (在執行緒池中運行) 處理單個 Shioaji 訂單/成交事件。
-        包含詳細的解析邏輯，創建 VnPy 物件，並調用 on_order/on_trade。
+        (Runs in Executor Thread Pool)
+        Processes a single Shioaji order/deal event. Parses the message,
+        creates VnPy OrderData and TradeData objects, and calls respective on_order/on_trade.
+        Handles partial fills by creating TradeData for each fill and accumulating traded volume.
         """
-        thread_name = threading.current_thread().name 
-        seqno: Optional[str] = None # 在 try 外部定義，確保 except 塊中可用
+        thread_name = threading.current_thread().name
+        shioaji_order_seqno: Optional[str] = None
 
         try:
-            # 1. 提取 Shioaji 訂單序號 (seqno)
-            if state in [SjOrderState.StockDeal, SjOrderState.FuturesDeal]:
-                seqno = message.get("seqno")
-                if not seqno and "order" in message and isinstance(message["order"], dict):
-                    seqno = message["order"].get("seqno")
-            elif "order" in message and isinstance(message["order"], dict):
-                seqno = message["order"].get("seqno")
-            elif "status" in message and isinstance(message["status"], dict):
-                seqno = message["status"].get("id") or message["status"].get("seqno")
+            # 1. Extract Shioaji Order Sequence Number (seqno)
+            # This seqno is the key to link Shioaji's update to our cached VnPy OrderData.
+            if "order" in message and isinstance(message["order"], dict):
+                shioaji_order_seqno = message["order"].get("seqno")
+            
+            if not shioaji_order_seqno and "status" in message and isinstance(message["status"], dict):
+                shioaji_order_seqno = message["status"].get("id") # Often used for order seqno in status messages
+                if not shioaji_order_seqno:
+                    shioaji_order_seqno = message["status"].get("seqno") # Fallback within status
 
-            if not seqno:
+            if not shioaji_order_seqno and state in [SjOrderState.StockDeal, SjOrderState.FuturesDeal]:
+                # For deal messages, 'seqno' at the root often refers to the order's seqno.
+                shioaji_order_seqno = message.get("seqno")
+
+            if not shioaji_order_seqno:
                 self.write_log(
-                    f"[{thread_name}] (Executor) 無法從Shioaji回調解析SeqNo，跳過處理。State='{state.value}', Msg Snippet='{str(message)[:150]}'",
+                    f"[{thread_name}] (Executor) Cannot parse Shioaji Order SeqNo. State: '{state.value}', Msg: '{str(message)[:150]}'",
                     level="warning"
                 )
                 return
 
-            vt_orderid = f"{self.gateway_name}.{seqno}"
-            # self.write_log(f"[{thread_name}] (Executor) 開始處理訂單事件: {vt_orderid}, Shioaji State={state.value}", level="debug")
+            vt_orderid = f"{self.gateway_name}.{shioaji_order_seqno}"
 
-            # 2. 從 Handler 的快取中獲取 OrderData
-            cached_order: Optional[OrderData] = None
+            # 2. Fetch Cached VnPy OrderData
             with self.order_map_lock:
                 cached_order = self.orders.get(vt_orderid)
-                # original_sj_trade_obj = self.shioaji_trades.get(seqno) # 如果需要原始SjTrade物件
+                if not cached_order:
+                    self.write_log(
+                        f"[{thread_name}] (Executor) No cached OrderData found for {vt_orderid}. State: '{state.value}'. Msg: '{str(message)[:100]}'",
+                        level="warning"
+                    )
+                    return
+                
+                # Work on a copy for modification, update original cache at the end if changed
+                order_to_update = copy.copy(cached_order) 
 
-            if not cached_order:
-                self.write_log(f"[{thread_name}] (Executor) 處理事件 {vt_orderid} 時，找不到對應的OrderData快取。", level="warning")
-                return
-            
-            # 3. 解析 Shioaji message，確定 VnPy 訂單狀態、成交量等
-            # (這部分邏輯直接從您之前完成的 _on_order_deal_shioaji 複製並調整)
-            final_vn_status: Status = cached_order.status
-            final_traded_qty: float = cached_order.traded
-            final_reference_msg: str = cached_order.reference
-            final_order_datetime: datetime = cached_order.datetime
+            # 3. Initialize/Prepare Fields for VnPy OrderData Update
+            # These will be updated based on the incoming message
+            final_vn_status: Status = order_to_update.status
+            cumulative_traded_qty_for_order: float = order_to_update.traded # Start with previously known traded qty
+            latest_activity_datetime: datetime = order_to_update.datetime # Start with previous activity time
+            final_reference_msg: str = order_to_update.reference
 
+            # 4. Parse Common Shioaji Blocks (status and operation)
             shioaji_status_block = message.get("status", message.get("order", {}))
             if not isinstance(shioaji_status_block, dict): shioaji_status_block = {}
 
+            shioaji_msg_from_status = shioaji_status_block.get("msg", "")
+            if shioaji_msg_from_status:
+                final_reference_msg = shioaji_msg_from_status
+            
+            # Shioaji's order_datetime for F&O is initial submission time.
+            # We'll use latest_activity_datetime to track the true last update.
+            # shioaji_order_initial_datetime_obj = shioaji_status_block.get("order_datetime")
+            # if isinstance(shioaji_order_initial_datetime_obj, datetime):
+            #     # This could be used to verify initial submission time if needed,
+            #     # but order_to_update.datetime already holds the submission time (or last known activity).
+            #     pass
+
+            operation_block = message.get("operation", {})
+            if isinstance(operation_block, dict):
+                op_msg_from_op = operation_block.get("op_msg")
+                if op_msg_from_op: # Operation message can be more specific
+                    final_reference_msg = op_msg_from_op
+
+            # 5. Determine Base VnPy Order Status from Shioaji Status/Operation codes
             shioaji_native_status_str = shioaji_status_block.get("status")
-            shioaji_msg_from_status = shioaji_status_block.get("msg", "") # msg from status block
-            shioaji_deal_qty_str = shioaji_status_block.get("deal_quantity")
-            shioaji_order_time_obj = shioaji_status_block.get("order_datetime")
-
-            if shioaji_msg_from_status: final_reference_msg = shioaji_msg_from_status
-            if isinstance(shioaji_order_time_obj, datetime):
-                final_order_datetime = shioaji_order_time_obj.replace(tzinfo=TAIPEI_TZ)
-
             if shioaji_native_status_str:
                 try:
                     current_shioaji_status_enum = SjStatus(shioaji_native_status_str)
                     mapped_status = STATUS_MAP.get(current_shioaji_status_enum)
-                    if mapped_status: 
+                    if mapped_status:
                         final_vn_status = mapped_status
-                    else: 
-                        self.write_log(f"[{thread_name}] (Executor) 未映射的Shioaji狀態 '{shioaji_native_status_str}' for {vt_orderid}", level="warning")
+                    
+                    # Futures/Options Rejection Check
+                    if order_to_update.exchange == Exchange.TAIFEX: # Assuming TAIFEX for F&O
+                        if current_shioaji_status_enum == SjStatus.Failed:
+                            final_vn_status = Status.REJECTED
                 except ValueError:
-                    self.write_log(f"[{thread_name}] (Executor) 無法識別Shioaji狀態字串 '{shioaji_native_status_str}' for {vt_orderid}", level="warning")
-            
-            if shioaji_deal_qty_str is not None:
-                try: 
-                    final_traded_qty = float(shioaji_deal_qty_str)
-                except ValueError: 
-                    self.write_log(f"[{thread_name}] (Executor) 無法轉換deal_quantity '{shioaji_deal_qty_str}' for {vt_orderid}", level="warning")
+                    self.write_log(f"[{thread_name}] (Executor) Unknown Shioaji status string '{shioaji_native_status_str}' for {vt_orderid}", level="warning")
 
-            operation_block = message.get("operation", {})
-            if isinstance(operation_block, dict):
-                op_type = operation_block.get("op_type")
+            # Stock Rejection/Failure Check from Operation Block
+            if order_to_update.exchange in [Exchange.TWSE, Exchange.TOTC]: # Assuming these for Stocks
                 op_code = operation_block.get("op_code")
-                op_msg_from_op = operation_block.get("op_msg")
-                if op_msg_from_op: final_reference_msg = op_msg_from_op # Operation message might be more specific
-                
-                if op_type == "Cancel" and op_code == "00": 
-                    final_vn_status = Status.CANCELLED
-                elif op_code and op_code != "00": # Any operation that failed
-                    if op_type == "New": # If a New order operation failed
-                        final_vn_status = Status.REJECTED
-                    # For other failed ops (like Cancel failed), the order status might not change to REJECTED.
-                    # It just means the operation itself failed.
-                    self.write_log(f"[{thread_name}] (Executor) Shioaji op '{op_type}' failed for {vt_orderid}: code='{op_code}', msg='{final_reference_msg}'", level="warning")
+                op_type = operation_block.get("op_type")
+                if op_code and op_code != "00":
+                    final_vn_status = Status.REJECTED # Generalize failure/rejection for stocks
+                    self.write_log(f"[{thread_name}] (Executor) Stock order {vt_orderid} operation '{op_type}' failed with op_code '{op_code}'. Ref: '{final_reference_msg}'", level="warning")
+            
+            # Cancellation Confirmation from Operation Block
+            if isinstance(operation_block, dict) and \
+            operation_block.get("op_type") == "Cancel" and \
+            operation_block.get("op_code") == "00":
+                final_vn_status = Status.CANCELLED
+                # Try to get a timestamp for the cancellation if available in message,
+                # otherwise, current time will be used for latest_activity_datetime later.
 
-            # 4. 如果是成交事件 (state is StockDeal/FuturesDeal), 處理成交 TradeData
+            # 6. Process Fills if this is a Deal Event
+            any_new_fill_processed = False
             if state in [SjOrderState.StockDeal, SjOrderState.FuturesDeal]:
-                # 'deals' list in shioaji_status_block or message itself can be a deal_item
-                deals_list = shioaji_status_block.get("deals", []) 
-                if not deals_list and "price" in message and "quantity" in message : # Check if message itself is a single deal
-                    deals_list = [message] 
-                
-                any_new_fill_processed_in_this_event = False
-                for deal_item in deals_list:
+                deals_to_process = []
+                if state == SjOrderState.StockDeal: # TFTDeal
+                    # The message itself is the deal_item for stocks
+                    deals_to_process = [message]
+                elif state == SjOrderState.FuturesDeal:
+                    # Deals are in a list for futures/options
+                    deals_to_process = shioaji_status_block.get("deals", [])
+
+                for deal_item in deals_to_process:
                     try:
                         deal_price_str = deal_item.get("price")
-                        deal_quantity_str = deal_item.get("quantity")
-                        # Shioaji Deal ID: 'id' in deal_item, or 'exchange_seq', or 'trade_id' from message
-                        shioaji_deal_id = deal_item.get("id") or deal_item.get("exchange_seq") or message.get("trade_id")
-                        deal_ts_raw = deal_item.get("ts")
-
-                        if not all([deal_price_str, deal_quantity_str, shioaji_deal_id, deal_ts_raw]):
-                            self.write_log(f"[{thread_name}] (Executor) 成交回報不完整 (Order: {vt_orderid}): {deal_item}", level="warning")
-                            continue
+                        deal_quantity_this_fill_str = deal_item.get("quantity") # Per-fill quantity
                         
-                        deal_price = float(deal_price_str)
-                        deal_quantity = float(deal_quantity_str)
-                        if deal_quantity <= 0: continue
+                        shioaji_fill_id: Optional[str] = None
+                        deal_ts_raw: Optional[Union[int, float]] = None
 
-                        deal_key = (str(shioaji_deal_id), str(seqno)) # Unique key for this deal
-                        with self.order_map_lock: # Protect self.shioaji_deals
+                        if state == SjOrderState.StockDeal:
+                            shioaji_fill_id = deal_item.get("exchange_seq") # Unique fill ID for stocks
+                            deal_ts_raw = deal_item.get("ts") # Integer seconds for stocks
+                        elif state == SjOrderState.FuturesDeal: # deal_item here is a Shioaji Deal object
+                            shioaji_fill_id = str(deal_item.seq) if hasattr(deal_item, 'seq') else None # Unique fill ID for F&O
+                            deal_ts_raw = deal_item.ts if hasattr(deal_item, 'ts') else None # Float seconds for F&O
+                            # Price and quantity might also be attributes like deal_item.price, deal_item.quantity
+                            if deal_price_str is None and hasattr(deal_item, 'price'): deal_price_str = str(deal_item.price)
+                            if deal_quantity_this_fill_str is None and hasattr(deal_item, 'quantity'): deal_quantity_this_fill_str = str(deal_item.quantity)
+
+
+                        if not all([deal_price_str, deal_quantity_this_fill_str, shioaji_fill_id, deal_ts_raw is not None]):
+                            self.write_log(f"[{thread_name}] (Executor) Incomplete fill data for order {vt_orderid}. Deal: '{deal_item}'", level="warning")
+                            continue
+
+                        deal_price = float(deal_price_str)
+                        deal_quantity_this_fill = float(deal_quantity_this_fill_str)
+
+                        if deal_quantity_this_fill <= 0:
+                            continue
+
+                        trade_datetime = datetime.fromtimestamp(float(deal_ts_raw), TAIPEI_TZ) # Timestamps are in seconds
+                        latest_activity_datetime = max(latest_activity_datetime, trade_datetime)
+
+                        # Prevent duplicate TradeData processing
+                        deal_key = (str(shioaji_fill_id), str(shioaji_order_seqno))
+                        with self.order_map_lock: # Protecting self.shioaji_deals
                             if deal_key in self.shioaji_deals:
-                                # self.write_log(f"[{thread_name}] (Executor) 重複成交回報 {deal_key} for {vt_orderid}, 已忽略.", level="debug")
+                                self.write_log(f"[{thread_name}] (Executor) Duplicate fill {deal_key} for order {vt_orderid}, skipping.", level="debug")
                                 continue
                             self.shioaji_deals.add(deal_key)
                         
-                        any_new_fill_processed_in_this_event = True
+                        any_new_fill_processed = True
+                        cumulative_traded_qty_for_order += deal_quantity_this_fill # Accumulate manually
 
-                        trade_datetime = datetime.now(TAIPEI_TZ) # Fallback
-                        if isinstance(deal_ts_raw, (int, float)):
-                            trade_datetime = datetime.fromtimestamp(deal_ts_raw / 1e9, tz=TAIPEI_TZ)
-                        elif isinstance(deal_ts_raw, datetime):
-                            trade_datetime = deal_ts_raw.replace(tzinfo=TAIPEI_TZ)
-                        
                         vnpy_trade = TradeData(
                             gateway_name=self.gateway_name,
                             accountid=self.vnpy_account_id,
-                            symbol=cached_order.symbol,
-                            exchange=cached_order.exchange,
-                            orderid=cached_order.vt_orderid,
-                            tradeid=f"{self.gateway_name}_{shioaji_deal_id}",
-                            direction=cached_order.direction,
-                            offset=cached_order.offset,
+                            symbol=order_to_update.symbol,
+                            exchange=order_to_update.exchange,
+                            orderid=order_to_update.vt_orderid,
+                            tradeid=f"{self.gateway_name}.{shioaji_fill_id}", # Make trade ID globally unique
+                            direction=order_to_update.direction,
+                            offset=order_to_update.offset,
                             price=deal_price,
-                            volume=deal_quantity,
+                            volume=deal_quantity_this_fill, # Volume of this specific fill
                             datetime=trade_datetime
                         )
-                        self.on_trade(vnpy_trade) # Send TradeData to manager
-                        final_order_datetime = max(final_order_datetime, trade_datetime) # Order's last activity time
+                        self.on_trade(vnpy_trade)
                     except Exception as e_deal_item:
-                        self.write_log(f"[{thread_name}] (Executor) 處理單筆成交時出錯 for order {vt_orderid}: {e_deal_item}\n{traceback.format_exc()}", level="error")
+                        self.write_log(f"[{thread_name}] (Executor) Error processing one fill for order {vt_orderid}: {e_deal_item}. Deal: '{deal_item}'\n{traceback.format_exc()}", level="error")
+
+            # 7. Update Final Order Status based on Accumulated Fills (if not already terminal)
+            if any_new_fill_processed and final_vn_status not in [Status.CANCELLED, Status.REJECTED]:
+                if abs(cumulative_traded_qty_for_order - order_to_update.volume) < 1e-6: # Float comparison
+                    final_vn_status = Status.ALLTRADED
+                elif cumulative_traded_qty_for_order > 0:
+                    final_vn_status = Status.PARTTRADED
+            
+            # If no new fills but status changed (e.g., from Shioaji status push like "Submitted", "PendingCancel")
+            # and if latest_activity_datetime was not updated by a fill, update it to now.
+            if not any_new_fill_processed and (final_vn_status != order_to_update.status or final_reference_msg != order_to_update.reference):
+                latest_activity_datetime = datetime.now(TAIPEI_TZ)
 
 
-                if any_new_fill_processed_in_this_event:
-                    # After processing all fills in this message, determine order status
-                    # based on cumulative final_traded_qty (which should be from shioaji_status_block.deal_quantity)
-                    if abs(final_traded_qty - cached_order.volume) < 1e-6 : # Fully filled
-                        final_vn_status = Status.ALLTRADED
-                    elif final_traded_qty > 0: # Partially filled
-                        final_vn_status = Status.PARTTRADED
-                    # else: if final_traded_qty is still 0, status is whatever it was before (e.g. SUBMITTING, NOTTRADED)
+            # 8. Update OrderData in Cache and Push Event if Changed
+            if (final_vn_status != order_to_update.status or
+                abs(cumulative_traded_qty_for_order - order_to_update.traded) > 1e-6 or # Compare float
+                final_reference_msg != order_to_update.reference or
+                latest_activity_datetime != order_to_update.datetime):
 
-            # 5. 更新 OrderData 快取並透過 Manager 發送更新 (僅當狀態或重要欄位改變時)
-            if (final_vn_status != cached_order.status or
-                abs(final_traded_qty - cached_order.traded) > 1e-6 or # Compare float for traded quantity
-                final_reference_msg != cached_order.reference or
-                final_order_datetime != cached_order.datetime):
+                order_to_update.status = final_vn_status
+                order_to_update.traded = cumulative_traded_qty_for_order
+                order_to_update.reference = final_reference_msg
+                order_to_update.datetime = latest_activity_datetime # Reflects last activity
 
                 with self.order_map_lock:
-                    cached_order.status = final_vn_status
-                    cached_order.traded = final_traded_qty
-                    cached_order.reference = final_reference_msg
-                    cached_order.datetime = final_order_datetime
-                
-                self.write_log(
-                    f"[{thread_name}] (Executor) 推送訂單更新: {cached_order.vt_orderid}, "
-                    f"VnPyStatus={cached_order.status.value}, TradedQty={cached_order.traded}, Ref='{cached_order.reference}'"
-                )
-                self.on_order(copy.copy(cached_order)) # Send a copy to manager
-            # else:
-            #     self.write_log(f"[{thread_name}] (Executor) Order {vt_orderid} status unchanged after processing. Current VnPy Status: {cached_order.status.value}", level="debug")
+                    self.orders[vt_orderid] = copy.copy(order_to_update) # Update cache with the modified copy
 
-        except Exception as e_process_event:
-            self.write_log(f"[{thread_name}] (Executor) _process_single_order_deal_event 處理時發生嚴重錯誤 for Shioaji SeqNo {seqno if seqno else 'Unknown'}: {e_process_event}\n{traceback.format_exc()}", level="error")
+                self.write_log(
+                    f"[{thread_name}] (Executor) Pushing Order Update: {order_to_update.vt_orderid}, "
+                    f"VnPyStatus={order_to_update.status.value}, TradedQty={order_to_update.traded}, Ref='{order_to_update.reference}'"
+                )
+                self.on_order(copy.copy(order_to_update)) # Push a new copy
+
+            # else:
+            #     self.write_log(f"[{thread_name}] (Executor) Order {vt_orderid} no significant change. Current VnPy Status: {order_to_update.status.value}, Traded: {order_to_update.traded}", level="debug")
+
+        except Exception as e_main:
+            log_seqno = shioaji_order_seqno if shioaji_order_seqno else "UnknownSeqno"
+            self.write_log(f"[{thread_name}] (Executor) CRITICAL ERROR in _process_single_order_deal_event for Shioaji SeqNo {log_seqno}: {e_main}\n{traceback.format_exc()}", level="critical")
 
 
     async def _queue_consumer(self) -> None:
@@ -1874,43 +1878,97 @@ class ShioajiSessionHandler(BaseGateway):
             
         return target_contract
 
-    def subscribe(self, req: SubscribeRequest) -> None: # Subscribes this session's API
-        vt = f"{req.symbol}.{req.exchange.value}"
+    def subscribe(self, req: SubscribeRequest) -> None:
+        """
+        (Handler specific) 執行實際的 Shioaji API 行情訂閱。
+        成功或失敗時，通過 on_event 通知 Manager。
+        此方法現在確保即使在重連時也會嘗試 API 訂閱。
+        """
+        vt_symbol = req.vt_symbol
+        self.write_log(f"Handler {self.gateway_name}: 嘗試 API 訂閱 {vt_symbol}")
+
         if not self._check_connection():
-            self.write_log(f"Handler {self.gateway_name}: Subscription failed (not connected) for {vt}", level="warning")
-            self.on_event(EVENT_SUBSCRIBE_FAILED, vt) # Notify manager via generic event
+            self.write_log(f"Handler {self.gateway_name}: API 訂閱失敗 (未連接) for {vt_symbol}", level="warning")
+            self.on_event(EVENT_SUBSCRIBE_FAILED, vt_symbol)
             return
 
         contract = self.find_sj_contract(req.symbol, req.exchange.value)
         if not contract:
-            self.write_log(f"Handler {self.gateway_name}: Subscription failed (contract not found) for {vt}", level="warning")
-            self.on_event(EVENT_SUBSCRIBE_FAILED, vt)
+            self.write_log(f"Handler {self.gateway_name}: API 訂閱失敗 (找不到合約 {req.symbol}@{req.exchange.value}) for {vt_symbol}", level="warning")
+            self.on_event(EVENT_SUBSCRIBE_FAILED, vt_symbol)
             return
-        
-        # MAX_CALLS check for this specific session
-        MAX_SESSION_SUBS = 190 # Shioaji per-session limit
+
+        # 檢查 Shioaji 的訂閱限制 (每個 session 約 190-200 個)
+        # 這個檢查在嘗試實際 API 訂閱前進行是合理的
         with self.subscribed_lock:
-            if len(self.subscribed) >= MAX_SESSION_SUBS:
-                self.write_log(f"Handler {self.gateway_name}: Subscription limit ({MAX_SESSION_SUBS}) reached for this session. Cannot subscribe {vt}", level="warning")
-                self.on_event(EVENT_SUBSCRIBE_FAILED, vt)
-                return
-            if vt in self.subscribed:
-                self.write_log(f"Handler {self.gateway_name}: Already subscribed to {vt} in this session.")
-                self.on_event(EVENT_SUBSCRIBE_SUCCESS, vt)
+            # 如果已在 self.subscribed 中，且不是因為重連（即 API 實例未變），則可能無需重複 API 調用
+            # 但 Shioaji 的 subscribe 是冪等的，重複調用通常無害
+            # 關鍵是在斷線重連後，即使 vt_symbol 在 self.subscribed 中，也要重新執行 API 調用
+            # 因此，我們不再檢查 if vt_symbol in self.subscribed 然後直接返回。
+            MAX_SESSION_SUBS = 190 # 或從設定讀取
+            # 如果 vt_symbol 不在 self.subscribed 中，才檢查是否會超出總數限制
+            if vt_symbol not in self.subscribed and len(self.subscribed) >= MAX_SESSION_SUBS:
+                self.write_log(f"Handler {self.gateway_name}: API 訂閱失敗，已達此 session 的訂閱上限 ({MAX_SESSION_SUBS}) for {vt_symbol}", level="warning")
+                self.on_event(EVENT_SUBSCRIBE_FAILED, vt_symbol)
                 return
         try:
+            # 實際調用 Shioaji API 進行訂閱
+            # Shioaji 的 subscribe 通常是冪等的，重複調用已訂閱的合約不會出錯
             self.api.quote.subscribe(contract, quote_type=SjQuoteType.Tick, version=SjQuoteVersion.v1)
             self.api.quote.subscribe(contract, quote_type=SjQuoteType.BidAsk, version=SjQuoteVersion.v1)
+
+            # 只有在 API 調用沒有引發異常時，才認為訂閱成功並更新內部狀態
             with self.subscribed_lock:
-                self.subscribed.add(vt)
-            self.write_log(f"Handler {self.gateway_name}: Successfully subscribed to {vt} (Tick & BidAsk).")
-            self.on_event(EVENT_SUBSCRIBE_SUCCESS, vt)
+                self.subscribed.add(vt_symbol) # 更新 Handler 內部的已訂閱列表
+
+            self.write_log(f"Handler {self.gateway_name}: 成功發送 API 訂閱請求 for {vt_symbol} (Tick & BidAsk).")
+            self.on_event(EVENT_SUBSCRIBE_SUCCESS, vt_symbol) # 通知 Manager 成功
+
         except Exception as ex:
-            self.write_log(f"Handler {self.gateway_name}: Subscription error for {vt}: {ex}", level="error")
-            self.on_event(EVENT_SUBSCRIBE_FAILED, vt)
+            self.write_log(f"Handler {self.gateway_name}: API 訂閱時發生錯誤 for {vt_symbol}: {ex}", level="error")
+            # 如果 API 訂閱失敗，確保從 self.subscribed 中移除 (如果之前錯誤地加入了)
+            with self.subscribed_lock:
+                self.subscribed.discard(vt_symbol)
+            self.on_event(EVENT_SUBSCRIBE_FAILED, vt_symbol) # 通知 Manager 失敗
 
+    def unsubscribe(self, req: SubscribeRequest) -> None:
+        """
+        (Handler specific) 執行實際的 Shioaji API 取消行情訂閱。
+        """
+        vt_symbol = req.vt_symbol
+        self.write_log(f"Handler {self.gateway_name}: 嘗試 API 取消訂閱 {vt_symbol}")
 
-# Inside ShioajiSessionHandler class:
+        if not self._check_connection():
+            self.write_log(f"Handler {self.gateway_name}: API 取消訂閱失敗 (未連接) for {vt_symbol}", level="warning")
+            # 此處不發送失敗事件，因為 Manager 是主動方
+            return
+
+        with self.subscribed_lock:
+            if vt_symbol not in self.subscribed:
+                self.write_log(f"Handler {self.gateway_name}: {vt_symbol} 未在此 Handler 的 API 層級訂閱列表中，無需取消。", level="info")
+                return # 可能 Manager 記錄有誤，或者此 Handler 已自行取消
+
+        contract = self.find_sj_contract(req.symbol, req.exchange.value)
+        if not contract:
+            self.write_log(f"Handler {self.gateway_name}: API 取消訂閱失敗 (找不到合約 {req.symbol}@{req.exchange.value}) for {vt_symbol}", level="warning")
+            return
+
+        try:
+            self.api.quote.unsubscribe(contract, quote_type=SjQuoteType.Tick, version=SjQuoteVersion.v1)
+            self.api.quote.unsubscribe(contract, quote_type=SjQuoteType.BidAsk, version=SjQuoteVersion.v1)
+
+            with self.subscribed_lock:
+                self.subscribed.discard(vt_symbol) # 從 Handler 內部的已訂閱列表中移除
+
+            self.write_log(f"Handler {self.gateway_name}: 成功發送 API 取消訂閱請求 for {vt_symbol}.")
+            # 可選：發送一個取消成功的事件給 Manager，但通常 Manager 主導取消，不需要回饋
+            # self.on_event("eUnsubscribeSuccess", vt_symbol)
+
+        except Exception as ex:
+            self.write_log(f"Handler {self.gateway_name}: API 取消訂閱時發生錯誤 for {vt_symbol}: {ex}", level="error")
+            # 即使 API 取消失敗，Manager 也已經認為此 Handler 不再負責此訂閱
+            # 如果需要，可以嘗試將其重新加入 self.subscribed，但邏輯會更複雜
+
 
     def send_order(self, req: OrderRequest, **kwargs) -> str:
         """
@@ -2883,9 +2941,9 @@ class ShioajiSessionHandler(BaseGateway):
                     net_position=True, # Futures are typically net position
                     history_data=True,
                 )
-                self.write_log(f"Handler: Processing contract - Symbol: {cd.symbol}, Exchange: {cd.exchange.value}, Product: {cd.product.value}, GW: {cd.gateway_name}") # 打印關鍵資訊
+                #self.write_log(f"Handler: Processing contract - Symbol: {cd.symbol}, Exchange: {cd.exchange.value}, Product: {cd.product.value}, GW: {cd.gateway_name}") # 打印關鍵資訊
                 parsed_contracts_tmp[cd.vt_symbol] = cd
-                self.on_contract(cd) # Send to manager
+                self.on_contract(cd) 
 
         else:
             self.write_log(f"提示 ({self.gateway_name}): 未找到期貨合約 (self.api.Contracts.Futures._code2contract)，跳過期貨處理。", level="info")
@@ -2968,16 +3026,15 @@ class ShioajiSessionHandler(BaseGateway):
 
         # 5. Store in handler's cache and send to manager
         final_contract_count = 0
-        if parsed_contracts_tmp: # Only proceed if any contracts were parsed
-            with self.contract_lock: # Protect access to self.contracts
-                self.contracts.clear() # Clear previous contracts for this handler
-                for vt_symbol, contract_data in parsed_contracts_tmp.items():
-                    self.contracts[vt_symbol] = contract_data # Store in handler's cache
-                    self.on_contract(contract_data) # Send to manager via callback
+        if parsed_contracts_tmp: 
+            with self.contract_lock: 
+                self.contracts.clear() 
+                for vt_symbol, contract_data_from_dict in parsed_contracts_tmp.items(): # Variable here is contract_data_from_dict
+                    self.contracts[vt_symbol] = contract_data_from_dict
+                    self.on_contract(contract_data_from_dict) # Use the loop variable
                     final_contract_count += 1
         
         self.write_log(f"完成處理合約 for Handler {self.gateway_name}. 推送 {final_contract_count} 檔合約 (共解析 {len(parsed_contracts_tmp)} 檔)。")
-
 
     def query_history(self, req: HistoryRequest) -> Optional[List[BarData]]:
         # Queries history using THIS handler's API.
