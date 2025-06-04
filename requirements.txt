@@ -66,7 +66,7 @@ python-dateutil==2.9.0.post0
 python-jose==3.4.0
 python-multipart==0.0.20
 pytz==2025.2
-pywin32==310
+pywin32==310; sys_platform == "win32"
 pyxll==5.10.1
 pyzmq==26.4.0
 qdarkstyle==3.2.3
@@ -83,7 +83,7 @@ shioaji==1.2.5
 six==1.17.0
 sniffio==1.3.1
 starlette==0.46.2
-ta-lib @ file:///C:/Users/charl/vnpy_inter_shioaji/ta_lib-0.6.3-cp312-cp312-win_amd64.whl
+ta-lib @ file:///C:/Users/charl/vnpy_inter_shioaji/ta_lib-0.6.3-cp312-cp312-win_amd64.whl; sys_platform == "win32"
 toolz==1.0.0
 tqdm==4.67.1
 traitlets==5.14.3
@@ -102,7 +102,7 @@ vnpy-ctp==6.7.7.1
 vnpy-datamanager==1.1.1
 vnpy-datarecorder==1.0.8
 vnpy-excelrtd==1.0.2
-vnpy-optionmaster @ file:///C:/Users/charl/vnpy_inter_shioaji/vnpy_optionmaster
+vnpy-optionmaster @ file:///C:/Users/charl/vnpy_inter_shioaji/vnpy_optionmaster; sys_platform == "win32"
 vnpy-paperaccount==1.0.6
 vnpy-portfoliomanager==1.0.4
 vnpy-portfoliostrategy==1.1.2
@@ -113,6 +113,6 @@ vnpy-spreadtrading==1.2.6
 vnpy-sqlite==1.1.0
 vnpy-webtrader==1.0.5
 websockets==15.0.1
-win32-setctime==1.2.0
+win32-setctime==1.2.0; sys_platform == "win32"
 xxhash==3.5.0
 zipp==3.21.0
