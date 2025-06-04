@@ -10,6 +10,10 @@ readme = "README.md"
 requires-python = ">=3.11"
 license = {text = "MIT"}
 authors = [{name = "TAI", email = "maintainer@example.com"}]
+dependencies = [
+    "vnpy>=4.0.0",
+    "shioaji>=1.2.5",
+]
 py-modules = [
     "run",
     "shioaji_session_handler",
@@ -21,3 +25,9 @@ tai-vnpy-gateway = "run:main"
 
 [project.urls]
 Homepage = "https://github.com/user/TAI_vnpy_gateway"
+
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
