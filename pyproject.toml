@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tai-vnpy-gateway"
+version = "0.1.0"
+description = "Multi-account Shioaji gateway for VnPy"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+authors = [{name = "TAI", email = "maintainer@example.com"}]
+py-modules = [
+    "run",
+    "shioaji_session_handler",
+    "shioaji_session_manager"
+]
+
+[project.scripts]
+tai-vnpy-gateway = "run:main"
+
+[project.urls]
+Homepage = "https://github.com/user/TAI_vnpy_gateway"
