@@ -83,7 +83,6 @@ shioaji==1.2.5
 six==1.17.0
 sniffio==1.3.1
 starlette==0.46.2
-ta-lib @ file:///C:/Users/charl/vnpy_inter_shioaji/ta_lib-0.6.3-cp312-cp312-win_amd64.whl
 toolz==1.0.0
 tqdm==4.67.1
 traitlets==5.14.3
@@ -102,7 +101,6 @@ vnpy-ctp==6.7.7.1
 vnpy-datamanager==1.1.1
 vnpy-datarecorder==1.0.8
 vnpy-excelrtd==1.0.2
-vnpy-optionmaster @ file:///C:/Users/charl/vnpy_inter_shioaji/vnpy_optionmaster
 vnpy-paperaccount==1.0.6
 vnpy-portfoliomanager==1.0.4
 vnpy-portfoliostrategy==1.1.2
