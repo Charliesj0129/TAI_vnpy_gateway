@@ -5,6 +5,7 @@ import copy
 import traceback
 from datetime import datetime, date, timedelta # 確保導入 date 和 time
 from threading import Lock, Thread # Lock and Thread are used by the class, not necessarily here
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional, Set, Tuple, Union, Callable
 from zoneinfo import ZoneInfo 
 import calendar
@@ -29,6 +30,9 @@ from vnpy.trader.constant import (
     Exchange, Product, Direction, OrderType, Offset, Status, Interval, OptionType
 )
 from vnpy.trader.utility import BarGenerator # Used in query_history
+
+# ThreadPool for CPU-intensive work
+HPC_EXECUTOR = ThreadPoolExecutor(max_workers=4)
 
 # --- Shioaji 相關導入 ---
 import shioaji as sj
@@ -526,11 +530,10 @@ class ShioajiSessionHandler(BaseGateway):
         
         self.write_log(f"Conflation processor for {self.gateway_name} stopped.")
 
-    async def _process_conflated_data_async(self, vt_symbol: str) -> None:
+    def _process_conflated_data_sync(self, vt_symbol: str) -> Optional[TickData]:
         """
-        (Async Method) 處理單一 vt_symbol 的聚合後行情數據。
-        從 latest_raw_... 快取中獲取最新原始數據，轉換為 VnPy TickData，
-        更新 self.tick_cache，並調用 self.on_tick()。
+        處理單一 vt_symbol 的聚合後行情數據，屬於 CPU 密集型任務，
+        會在 HPC_EXECUTOR 執行並返回轉換後的 TickData。
         """
         try:
             # 1. 安全地獲取最新的原始數據 (tick 和 bid/ask)
@@ -677,17 +680,25 @@ class ShioajiSessionHandler(BaseGateway):
 
             # 設定最終的時間戳和本地接收時間
             vnpy_tick.datetime = final_datetime_to_use
-            vnpy_tick.localtime = datetime.now() # 本地接收並處理完成的時間
+            vnpy_tick.localtime = datetime.now()
 
-            # 4. 更新 self.tick_cache 並推送
             with self.tick_cache_lock:
-                self.tick_cache[vt_symbol] = vnpy_tick # 更新快取中的合併後 TickData
-            
-            self.on_tick(copy.copy(vnpy_tick)) # 推送副本給 Manager
+                self.tick_cache[vt_symbol] = vnpy_tick
+
+            return vnpy_tick
 
         except Exception as e:
             self.write_log(f"處理聚合行情數據 _process_conflated_data_async for {vt_symbol} 時出錯: {e}\n{traceback.format_exc()}", level="error")
 
+            return None
+
+    async def _process_conflated_data_async(self, vt_symbol: str) -> None:
+        """Wrapper to run _process_conflated_data_sync in HPC_EXECUTOR."""
+        tick = await asyncio.get_running_loop().run_in_executor(
+            HPC_EXECUTOR, self._process_conflated_data_sync, vt_symbol
+        )
+        if tick:
+            self.on_tick(copy.copy(tick))
 
     def _on_tick_stk(self, exchange: SjExchange, tick: TickSTKv1) -> None:
         """(Conflation Optimized) 處理 Shioaji 股票 TickSTKv1 原始數據。"""

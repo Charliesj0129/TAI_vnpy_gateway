@@ -1,7 +1,8 @@
 # shioaji_session_manager.py (New file or add to the above)
 from typing import Dict, Any, Optional, List, Tuple, Set
 from datetime import datetime
-from threading import Lock
+from threading import Lock, Thread
+from queue import Queue, Full
 import time
 
 from vnpy.trader.event import EVENT_LOG, EVENT_CONTRACT
@@ -62,6 +63,11 @@ class ShioajiSessionManager(BaseGateway):
         # --- End Timer Attributes ---
         self.default_order_account_id: Optional[str] = None
         self.connect_delay_seconds: float = 1.0 # 預設延遲1秒
+
+        # --- Event queue for decoupled handler communication ---
+        self._event_queue: Queue = Queue(maxsize=10000)
+        self._consumer_thread: Optional[Thread] = None
+        self._consumer_running: bool = False
 
         # Note: _register_timer() will be called after settings are loaded in connect()
 
@@ -132,7 +138,7 @@ class ShioajiSessionManager(BaseGateway):
                     is_primary_contract_h = (self.primary_contract_handler_id == vnpy_account_id) or \
                                      (not self.primary_contract_handler_id and not self.handlers)
                     handler = ShioajiSessionHandler(
-                        manager_event_callback=self._handle_event_from_handler,
+                        manager_event_callback=self._enqueue_event_from_handler,
                         gateway_name=handler_gateway_name,
                         vnpy_account_id=vnpy_account_id
                     )
@@ -154,6 +160,7 @@ class ShioajiSessionManager(BaseGateway):
                 self.write_log(f"由於未在設定檔中指定，將使用配置中的第一個帳戶 {self.default_order_account_id} 作為預設下單帳戶的備選。")
 
         self._register_timer()
+        self._start_event_consumer()
 
 
     def _register_timer(self) -> None:
@@ -170,6 +177,29 @@ class ShioajiSessionManager(BaseGateway):
                 self.write_log("Manager periodic query timer unregistered.")
             except Exception as e: # MainEngine might raise error if already unregistered
                 self.write_log(f"Error unregistering timer (might be already unregistered): {e}", level="warning")
+
+    def _enqueue_event_from_handler(self, event_type: str, data: Any, origin: str) -> None:
+        """Place handler events into the manager's queue for async processing."""
+        try:
+            self._event_queue.put_nowait((event_type, data, origin))
+        except Full:
+            self.write_log("Manager event queue full, dropping event.", level="warning")
+
+    def _start_event_consumer(self) -> None:
+        """Launch a background thread to consume events from handlers."""
+        if self._consumer_thread and self._consumer_thread.is_alive():
+            return
+
+        self._consumer_running = True
+        self._consumer_thread = Thread(target=self._event_consumer, daemon=True)
+        self._consumer_thread.start()
+
+    def _event_consumer(self) -> None:
+        while self._consumer_running:
+            item = self._event_queue.get()
+            if item is None:
+                break
+            self._handle_event_from_handler(*item)
 
 
     def process_timer_event(self, event: Event) -> None: # event type is vnpy.event.Event
@@ -716,7 +746,14 @@ class ShioajiSessionManager(BaseGateway):
     def close(self) -> None:
         self.write_log("Closing Shioaji Session Manager...")
         self._unregister_timer() # <<< ADDED: Unregister timer first
-        
+
+        if self._consumer_running:
+            self._consumer_running = False
+            self._event_queue.put(None)
+            if self._consumer_thread:
+                self._consumer_thread.join()
+                self._consumer_thread = None
+
         for vnpy_account_id, handler in self.handlers.items():
             self.write_log(f"Closing handler for {vnpy_account_id}...")
             try:
