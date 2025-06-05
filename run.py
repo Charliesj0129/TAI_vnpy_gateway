@@ -5,6 +5,9 @@ from vnpy.trader.engine import MainEngine
 from vnpy.trader.ui import MainWindow, create_qapp
 from vnpy.trader.constant import Exchange      # 用於 extend_enum
 from aenum import extend_enum                  # 用於擴展 Exchange 枚舉
+import uvloop
+
+uvloop.install()
 # from qtpy import API_NAME # 移除調試用的 API_NAME 打印
 # from qtpy.QtWidgets import QApplication # 移除調試用的 QApplication 打印
 
