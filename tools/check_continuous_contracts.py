@@ -33,7 +33,7 @@ def generate_continuous_contract(db_path, product_base, r1_symbol_name):
         #    按 datetime 升序，然後按 symbol 降序 (確保最新月合約在前)
         #    同時選出原始 symbol，主要用於 ORDER BY
         print(f"  正在提取 '{product_base}%' ({TARGET_INTERVAL}) 的原始月合約資料...")
-        select_query = f"""
+        select_query = """
         SELECT 
             symbol, exchange, datetime, volume, turnover, open_interest, 
             open_price, high_price, low_price, close_price 
@@ -102,7 +102,7 @@ def generate_continuous_contract(db_path, product_base, r1_symbol_name):
             conn.commit()
             print(f"  成功插入 {cursor.rowcount} 筆 '{r1_symbol_name}' 資料。")
         else:
-            print(f"  沒有準備好可插入的 R1 資料 (可能所有資料都已存在或被過濾)。")
+            print("  沒有準備好可插入的 R1 資料 (可能所有資料都已存在或被過濾)。")
 
     except sqlite3.Error as e:
         print(f"資料庫錯誤 ({product_base}): {e}")

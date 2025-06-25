@@ -12,14 +12,10 @@ import time
 import threading
 import asyncio
 import janus # Janus is used by the class for async queue handling
-# import threading # Already imported via `from threading import Lock, Thread`
-# import asyncio # Used by the class
-# import janus # Used by the class
-
+import pandas as pd # Pandas is used for DataFrame handling in query_history
 # --- VnPy 相關導入 ---
 # from vnpy.event import EventEngine,Event # EventEngine not directly used by handler, Event used by class methods
 
-from vnpy.trader.event import EVENT_CONTRACT
 from vnpy.trader.gateway import BaseGateway # Imported for class inheritance
 from vnpy.trader.object import (
     TickData, OrderData, TradeData, PositionData, AccountData, ContractData, 
@@ -28,7 +24,6 @@ from vnpy.trader.object import (
 from vnpy.trader.constant import (
     Exchange, Product, Direction, OrderType, Offset, Status, Interval, OptionType
 )
-from vnpy.trader.utility import BarGenerator # Used in query_history
 
 # --- Shioaji 相關導入 ---
 import shioaji as sj
@@ -50,9 +45,9 @@ from shioaji.constant import (
     OptionRight as SjOptionRight,
 )
 from shioaji.account import Account as SjAccount, AccountType as SjAccountType, StockAccount as SjStockAccount, FutureAccount as SjFutureAccount
-from shioaji.contracts import Contract as SjContract, FetchStatus as SjFetchStatus ,Option as sjOption, Stock as SjStock, Future as SjFuture
+from shioaji.contracts import Contract as SjContract, FetchStatus as SjFetchStatus ,Option as sjOption
 from shioaji.order import Trade as SjTrade # Used in type hints and caches
-from shioaji.position import StockPosition as SjStockPosition, FuturePosition as SjFuturePosition, Margin as SjMargin, AccountBalance as SjAccountBalance
+from shioaji.position import StockPosition as SjStockPosition, FuturePosition as SjFuturePosition
 from shioaji.stream_data_type import TickSTKv1, TickFOPv1, BidAskSTKv1, BidAskFOPv1 
 from shioaji.data import Kbars as SjKbars 
 from shioaji.error import TokenError as SjTokenError, AccountNotSignError as SjAccountNotSignError
@@ -246,12 +241,14 @@ class ShioajiSessionHandler(BaseGateway):
     def __init__(
         self, 
         manager_event_callback: Callable, # Callback to send events to manager
-        gateway_name: str,                # e.g., "SHIOAJI_MULTI.ACCOUNT1"
+        manager_gateway_name: str,
+        gateway_name: str,           # e.g., "SHIOAJI_MULTI.ACCOUNT1"
         vnpy_account_id: str              # e.g., "STOCK_ACCOUNT_01"
     ):
         super().__init__(None, gateway_name) # event_engine is None, manager handles events
 
         self.manager_event_callback = manager_event_callback
+        self.manager_gateway_name = manager_gateway_name
         self.vnpy_account_id = vnpy_account_id
 
         self.sj_exchange_map_vnpy_enum: Dict[SjExchange, Exchange] = {
@@ -460,7 +457,7 @@ class ShioajiSessionHandler(BaseGateway):
 
     # Override write_log to send LogData via manager if preferred
     def write_log(self, msg: str, level: str = "info"): # level is for guidance, LogData doesn't store it.
-        log_data = LogData(msg=msg, gateway_name=self.gateway_name) # Handler's specific name
+        log_data = LogData(msg=msg, gateway_name=self.manager_gateway_name) # Handler's specific name
         # Log level could be part of the msg string: f"[{level.upper()}] {msg}"
         self.manager_event_callback("log", log_data, self.vnpy_account_id)
 
@@ -567,7 +564,7 @@ class ShioajiSessionHandler(BaseGateway):
                     is_new_tick_object = True
                     # 創建一個基礎的 TickData 物件
                     vnpy_tick = TickData(
-                        gateway_name=self.gateway_name,
+                        gateway_name=self.manager_gateway_name,
                         symbol=symbol,
                         exchange=vn_exchange,
                         name=symbol, # 初始名稱，後面可以從合約或 Shioaji tick 中獲取更準確的名稱
@@ -1138,7 +1135,7 @@ class ShioajiSessionHandler(BaseGateway):
                             accountid=self.vnpy_account_id, # Use the VnPy level account ID for this handler
                             balance=float(balance_info.acc_balance),
                             frozen=0.0, # Shioaji stock balance might not directly show 'frozen' for open orders
-                            gateway_name=self.gateway_name 
+                            gateway_name=self.manager_gateway_name 
                         )
                         self.on_account(acc_data) # Send to manager
                     else:
@@ -1159,7 +1156,7 @@ class ShioajiSessionHandler(BaseGateway):
                             accountid=self.vnpy_account_id, # Use the VnPy level account ID
                             balance=float(margin_info.equity_amount),
                             frozen=float(margin_info.initial_margin + margin_info.order_margin_premium), # Approximation of frozen
-                            gateway_name=self.gateway_name 
+                            gateway_name=self.manager_gateway_name
                         )
                         self.on_account(acc_data) # Send to manager
                     else:
@@ -1223,7 +1220,7 @@ class ShioajiSessionHandler(BaseGateway):
                     frozen = max(0.0, volume - yd_volume) 
 
                 position_data = PositionData(
-                    gateway_name=self.gateway_name,
+                    gateway_name=self.manager_gateway_name,
                     symbol=code,
                     exchange=vn_exchange_derived, # 使用從合約中確定的 VnPy Exchange
                     direction=vn_direction,
@@ -1289,7 +1286,7 @@ class ShioajiSessionHandler(BaseGateway):
                     
                     if old_pos_data: 
                         zeroed_pos = PositionData(
-                            gateway_name=self.gateway_name,
+                            gateway_name=self.manager_gateway_name,
                             symbol=old_pos_data.symbol,       
                             exchange=old_pos_data.exchange,   
                             direction=direction_key, 
@@ -1438,7 +1435,7 @@ class ShioajiSessionHandler(BaseGateway):
                             trade_datetime = deal_ts_raw.replace(tzinfo=TAIPEI_TZ)
                         
                         vnpy_trade = TradeData(
-                            gateway_name=self.gateway_name,
+                            gateway_name=self.manager_gateway_name,
                             accountid=self.vnpy_account_id,
                             symbol=cached_order.symbol,
                             exchange=cached_order.exchange,
@@ -1576,7 +1573,7 @@ class ShioajiSessionHandler(BaseGateway):
                 )
                 return
 
-            vt_orderid = f"{self.gateway_name}.{shioaji_order_seqno}"
+            vt_orderid = f"{self.manager_gateway_name}.{shioaji_order_seqno}"
 
             # 2. Fetch Cached VnPy OrderData
             with self.order_map_lock:
@@ -1707,12 +1704,12 @@ class ShioajiSessionHandler(BaseGateway):
                         cumulative_traded_qty_for_order += deal_quantity_this_fill # Accumulate manually
 
                         vnpy_trade = TradeData(
-                            gateway_name=self.gateway_name,
+                            gateway_name=self.manager_gateway_name,
                             accountid=self.vnpy_account_id,
                             symbol=order_to_update.symbol,
                             exchange=order_to_update.exchange,
                             orderid=order_to_update.vt_orderid,
-                            tradeid=f"{self.gateway_name}.{shioaji_fill_id}", # Make trade ID globally unique
+                            tradeid=f"{self.manager_gateway_name}.{shioaji_fill_id}", # Make trade ID globally unique
                             direction=order_to_update.direction,
                             offset=order_to_update.offset,
                             price=deal_price,
@@ -1985,8 +1982,8 @@ class ShioajiSessionHandler(BaseGateway):
             )
             # 創建一個 REJECTED 狀態的 OrderData 並透過 manager 發送
             order = req.create_order_data(
-                orderid=f"{self.gateway_name}.ACC_MISMATCH_{datetime.now().strftime('%H%M%S_%f')}", # Handler-specific order ID
-                gateway_name=self.gateway_name # Handler's specific gateway name
+                orderid=f"{self.manager_gateway_name}.ACC_MISMATCH_{datetime.now().strftime('%H%M%S_%f')}", # Handler-specific order ID
+                gateway_name=self.manager_gateway_name # Handler's specific gateway name
             )
             order.status = Status.REJECTED
             order.accountid = req.accountid # Retain original requested accountid for logging/tracing
@@ -1999,8 +1996,8 @@ class ShioajiSessionHandler(BaseGateway):
         if not self._check_connection(check_ca=True):
             self.write_log(f"Order rejected: Handler {self.gateway_name} not connected or CA not signed.", level="warning")
             order = req.create_order_data(
-                orderid=f"{self.gateway_name}.CONN_REJECT_{datetime.now().strftime('%H%M%S_%f')}",
-                gateway_name=self.gateway_name
+                orderid=f"{self.manager_gateway_name}.CONN_REJECT_{datetime.now().strftime('%H%M%S_%f')}",
+                gateway_name=self.manager_gateway_name
             )
             order.status = Status.REJECTED
             order.accountid = self.vnpy_account_id # This handler's account
@@ -2019,8 +2016,8 @@ class ShioajiSessionHandler(BaseGateway):
         if not sj_contract:
             self.write_log(f"Order rejected: Contract not found for {vt_symbol} in handler {self.gateway_name}.", level="warning")
             order = req.create_order_data(
-                orderid=f"{self.gateway_name}.NO_CONTRACT_{datetime.now().strftime('%H%M%S_%f')}",
-                gateway_name=self.gateway_name
+                orderid=f"{self.manager_gateway_name}.NO_CONTRACT_{datetime.now().strftime('%H%M%S_%f')}",
+                gateway_name=self.manager_gateway_name
             )
             order.status = Status.REJECTED
             order.accountid = self.vnpy_account_id
@@ -2035,8 +2032,8 @@ class ShioajiSessionHandler(BaseGateway):
         if not product:
             self.write_log(f"Order rejected: Cannot determine product type for {sj_contract.security_type} from handler {self.gateway_name}.", level="warning")
             order = req.create_order_data(
-                orderid=f"{self.gateway_name}.NO_PRODUCT_{datetime.now().strftime('%H%M%S_%f')}",
-                gateway_name=self.gateway_name
+                orderid=f"{self.manager_gateway_name}.NO_PRODUCT_{datetime.now().strftime('%H%M%S_%f')}",
+                gateway_name=self.manager_gateway_name
             )
             order.status = Status.REJECTED
             order.accountid = self.vnpy_account_id
@@ -2053,8 +2050,8 @@ class ShioajiSessionHandler(BaseGateway):
         else:
             self.write_log(f"Order rejected: Unsupported product type {product.value} by handler {self.gateway_name}.", level="warning")
             order = req.create_order_data(
-                orderid=f"{self.gateway_name}.PROD_REJECT_{datetime.now().strftime('%H%M%S_%f')}",
-                gateway_name=self.gateway_name
+                orderid=f"{self.manager_gateway_name}.PROD_REJECT_{datetime.now().strftime('%H%M%S_%f')}",
+                gateway_name=self.manager_gateway_name
             )
             order.status = Status.REJECTED
             order.accountid = self.vnpy_account_id
@@ -2065,8 +2062,8 @@ class ShioajiSessionHandler(BaseGateway):
         if order_args is None:
             self.write_log(f"Order rejected: Failed to prepare order arguments for {vt_symbol}, Type: {req.type.value} in handler {self.gateway_name}.", level="warning")
             order = req.create_order_data(
-                orderid=f"{self.gateway_name}.PREP_ERR_{datetime.now().strftime('%H%M%S_%f')}",
-                gateway_name=self.gateway_name
+                orderid=f"{self.manager_gateway_name}.PREP_ERR_{datetime.now().strftime('%H%M%S_%f')}",
+                gateway_name=self.manager_gateway_name
             )
             order.status = Status.REJECTED
             order.accountid = self.vnpy_account_id
@@ -2085,8 +2082,8 @@ class ShioajiSessionHandler(BaseGateway):
         if not shioaji_api_account:
             self.write_log(f"Order rejected: No default Shioaji {product.value} account set for handler {self.gateway_name}.", level="error")
             order = req.create_order_data(
-                orderid=f"{self.gateway_name}.NO_SJ_ACC_{datetime.now().strftime('%H%M%S_%f')}",
-                gateway_name=self.gateway_name
+                orderid=f"{self.manager_gateway_name}.NO_SJ_ACC_{datetime.now().strftime('%H%M%S_%f')}",
+                gateway_name=self.manager_gateway_name
             )
             order.status = Status.REJECTED
             order.accountid = self.vnpy_account_id
@@ -2103,8 +2100,8 @@ class ShioajiSessionHandler(BaseGateway):
         except Exception as e_build:
             self.write_log(f"Order rejected: Failed to build Shioaji.Order object: {e_build}\nArgs: {order_args}", level="error")
             order = req.create_order_data(
-                orderid=f"{self.gateway_name}.BUILD_ERR_{datetime.now().strftime('%H%M%S_%f')}",
-                gateway_name=self.gateway_name
+                orderid=f"{self.manager_gateway_name}.BUILD_ERR_{datetime.now().strftime('%H%M%S_%f')}",
+                gateway_name=self.manager_gateway_name
             )
             order.status = Status.REJECTED
             order.accountid = self.vnpy_account_id
@@ -2120,7 +2117,7 @@ class ShioajiSessionHandler(BaseGateway):
             if trade_resp and trade_resp.order and trade_resp.status:
                 shioaji_seqno = trade_resp.order.seqno
                 # <<< MODIFIED: vt_orderid now includes handler's unique gateway_name >>>
-                vt_orderid = f"{self.gateway_name}.{shioaji_seqno}" 
+                vt_orderid = f"{self.manager_gateway_name}.{shioaji_seqno}" 
 
                 order_status_from_resp = STATUS_MAP.get(trade_resp.status.status, Status.SUBMITTING)
                 order_datetime_from_resp = datetime.now(TAIPEI_TZ) # Default to now
@@ -2128,7 +2125,7 @@ class ShioajiSessionHandler(BaseGateway):
                     order_datetime_from_resp = trade_resp.status.order_datetime.replace(tzinfo=TAIPEI_TZ)
 
                 order = OrderData(
-                    gateway_name=self.gateway_name,     # <<< MODIFIED: Handler's unique name
+                    gateway_name=self.manager_gateway_name,     # <<< MODIFIED: Handler's unique name
                     accountid=self.vnpy_account_id,     # <<< ADDED: Handler's VnPy account ID
                     symbol=symbol,
                     exchange=req.exchange,
@@ -2155,8 +2152,8 @@ class ShioajiSessionHandler(BaseGateway):
                 err_msg = f"Shioaji place_order did not return valid Trade/Order/Status. Response: {repr(trade_resp)}"
                 self.write_log(f"Order rejected by handler {self.gateway_name}: {err_msg}", level="error")
                 order = req.create_order_data(
-                    orderid=f"{self.gateway_name}.RESP_ERR_{datetime.now().strftime('%H%M%S_%f')}",
-                    gateway_name=self.gateway_name
+                    orderid=f"{self.manager_gateway_name}.RESP_ERR_{datetime.now().strftime('%H%M%S_%f')}",
+                    gateway_name=self.manager_gateway_name
                 )
                 order.status = Status.REJECTED
                 order.accountid = self.vnpy_account_id
@@ -2167,8 +2164,8 @@ class ShioajiSessionHandler(BaseGateway):
         except SjAccountNotSignError as e_sign:
             self.write_log(f"Order rejected by handler {self.gateway_name}: Account not signed for CA - {e_sign}", level="error")
             order = req.create_order_data(
-                orderid=f"{self.gateway_name}.SIGN_ERR_{datetime.now().strftime('%H%M%S_%f')}",
-                gateway_name=self.gateway_name
+                orderid=f"{self.manager_gateway_name}.SIGN_ERR_{datetime.now().strftime('%H%M%S_%f')}",
+                gateway_name=self.manager_gateway_name
             )
             order.status = Status.REJECTED
             order.accountid = self.vnpy_account_id
@@ -2178,8 +2175,8 @@ class ShioajiSessionHandler(BaseGateway):
         except Exception as e_place:
             self.write_log(f"Order placement error in handler {self.gateway_name}: {e_place}\n{traceback.format_exc()}", level="error")
             order = req.create_order_data(
-                orderid=f"{self.gateway_name}.API_ERR_{datetime.now().strftime('%H%M%S_%f')}",
-                gateway_name=self.gateway_name
+                orderid=f"{self.manager_gateway_name}.API_ERR_{datetime.now().strftime('%H%M%S_%f')}",
+                gateway_name=self.manager_gateway_name
             )
             order.status = Status.REJECTED
             order.accountid = self.vnpy_account_id
@@ -2410,267 +2407,6 @@ class ShioajiSessionHandler(BaseGateway):
         self.write_log(f"Handler {self.gateway_name}: Prepared futures/options order args for {req.symbol}: {args}", level="info")
         return args
 
-
-    def _on_order_deal_shioaji(self, state: SjOrderState, message: dict) -> None:
-        """
-        處理來自 Shioaji 的訂單狀態和成交回報。
-        - state: Shioaji 的 OrderState 枚舉，指示回報類型 (e.g., Order, StockDeal, FuturesDeal, Status)。
-        - message: 包含詳細回報內容的字典。
-        """
-        thread_name = threading.current_thread().name # 用於日誌，了解回調在哪個執行緒
-
-        # 1. 從 message 中提取 Shioaji 訂單序號 (seqno)
-        seqno: Optional[str] = None
-        if state in [SjOrderState.StockDeal, SjOrderState.FuturesDeal]: # 成交回報
-            # Shioaji 的成交回報中，'seqno' 通常指訂單序號，'trade_id' 或 'id' 可能指成交編號
-            seqno = message.get("seqno") 
-            if not seqno and "order" in message and isinstance(message["order"], dict): # 有時成交回報會包在 order 結構裡
-                seqno = message["order"].get("seqno")
-            # 如果還是沒有，嘗試 trade_id 作為備用 (雖然 trade_id 更像是成交自身的ID)
-            # if not seqno:
-            #     seqno = message.get("trade_id") # 這通常是 deal id，不是 order seqno
-        
-        elif "order" in message and isinstance(message["order"], dict): # 訂單狀態更新 (非成交)
-            seqno = message["order"].get("seqno")
-        
-        elif "status" in message and isinstance(message["status"], dict): # 另一種可能的訂單狀態更新結構
-            seqno = message["status"].get("id") # Shioaji status block might use 'id' for order seqno
-            if not seqno: # Backup, if 'id' isn't seqno, try 'seqno' if present
-                seqno = message["status"].get("seqno")
-
-        if not seqno:
-            self.write_log(
-                f"無法從 Shioaji 回調中解析訂單序號 (SeqNo)。State='{state.value}', Msg='{message}'",
-                level="warning"
-            )
-            return
-
-        # 2. 產生 Handler 內部唯一的 vt_orderid，並從快取中獲取 OrderData
-        # self.gateway_name 此時是 Handler 的唯一名稱, e.g., "SHIOAJI_MULTI.ACCOUNT1"
-        vt_orderid = f"{self.gateway_name}.{seqno}"
-        
-        self.write_log(f"處理 Shioaji 訂單回調: {vt_orderid}, State='{state.value}'", level="debug")
-        # self.write_log(f"Raw Message: {message}", level="debug") # For very detailed debugging
-
-        cached_order: Optional[OrderData] = None
-        original_sj_trade_obj: Optional[SjTrade] = None # Shioaji 的 Trade 物件 (代表一筆委託)
-
-        with self.order_map_lock: # 保護對 self.orders 和 self.shioaji_trades 的訪問
-            cached_order = self.orders.get(vt_orderid)
-            original_sj_trade_obj = self.shioaji_trades.get(seqno) # Keyed by Shioaji seqno
-
-        if not cached_order:
-            self.write_log(
-                f"找不到對應的 OrderData 快取: {vt_orderid}。可能為早於此連線會話的訂單回報，或 Manager 未正確路由。",
-                level="warning"
-            )
-            # 如果希望處理這種情況 (例如，為盤初收到的未知單建立新的 OrderData)，需要額外邏輯。
-            # 目前，如果本地沒有快取，則忽略。
-            return
-
-        # 確保 cached_order 的 accountid 是此 Handler 的 vnpy_account_id
-        # 這在 send_order 時就應該設定好，此處為防禦性檢查或記錄
-        if cached_order.accountid != self.vnpy_account_id:
-            self.write_log(
-                f"OrderData {vt_orderid} 的 accountid '{cached_order.accountid}' "
-                f"與 Handler 的 vnpy_account_id '{self.vnpy_account_id}' 不符。",
-                level="error"
-            )
-            # 根據策略決定是否繼續處理或報錯
-
-        # 3. (可選) 調用 self.api.update_status() 獲取最新狀態
-        # 這個操作是同步阻塞的，可能會影響效能，尤其是在高頻回調時。
-        # 建議優先依賴 Shioaji 主動推送的 `message`。
-        # 如果要使用，需要確保 `original_sj_trade_obj.order.account` 是有效的 Shioaji Account 物件。
-        # status_updated_via_api = False
-        # if original_sj_trade_obj and original_sj_trade_obj.order and original_sj_trade_obj.order.account:
-        #     try:
-        #         # self.api.update_status(account=original_sj_trade_obj.order.account)
-        #         # status_updated_via_api = True
-        #         # self.write_log(f"Updated status via API for order {vt_orderid}, new SjStatus: {original_sj_trade_obj.status.status}", level="debug")
-        #     except Exception as e_upd:
-        #         self.write_log(f"Error calling api.update_status for order {vt_orderid}: {e_upd}", level="warning")
-
-        # 4. 解析回報訊息，確定 VnPy 訂單狀態、已成交數量、參考訊息和時間
-        final_vn_status: Status = cached_order.status # 預設為快取中的狀態，避免不必要的更新
-        final_traded_qty: float = cached_order.traded
-        final_reference_msg: str = cached_order.reference
-        final_order_datetime: datetime = cached_order.datetime
-
-        # 提取 Shioaji 的狀態資訊 (通常在 'status' 或 'order' 字典中)
-        shioaji_status_block = message.get("status", message.get("order", {})) # Common patterns
-        if not isinstance(shioaji_status_block, dict): # Ensure it's a dict
-            shioaji_status_block = {}
-
-        shioaji_native_status_str = shioaji_status_block.get("status") # e.g., "Filled", "Cancelled"
-        shioaji_msg = shioaji_status_block.get("msg", "")
-        shioaji_deal_qty_str = shioaji_status_block.get("deal_quantity")
-        shioaji_order_time_obj = shioaji_status_block.get("order_datetime") # This is often order submission time
-        
-        # 更新參考訊息
-        if shioaji_msg:
-            final_reference_msg = shioaji_msg
-
-        # 更新訂單時間 (如果回報中有更新的時間)
-        if isinstance(shioaji_order_time_obj, datetime):
-            final_order_datetime = shioaji_order_time_obj.replace(tzinfo=TAIPEI_TZ)
-        
-        # 轉換 Shioaji 狀態為 VnPy 狀態
-        current_shioaji_status_enum: Optional[SjStatus] = None
-        if shioaji_native_status_str:
-            try:
-                current_shioaji_status_enum = SjStatus(shioaji_native_status_str) # Try to convert string to SjStatus enum
-                mapped_status = STATUS_MAP.get(current_shioaji_status_enum)
-                if mapped_status:
-                    final_vn_status = mapped_status
-                else:
-                    self.write_log(f"未映射的 Shioaji 狀態 '{shioaji_native_status_str}' (Enum: {current_shioaji_status_enum}) for order {vt_orderid}.", level="warning")
-            except ValueError: # If string is not a valid SjStatus member
-                self.write_log(f"無法識別的 Shioaji 狀態字串 '{shioaji_native_status_str}' for order {vt_orderid}.", level="warning")
-        
-        # 更新已成交數量 (如果回報中有)
-        if shioaji_deal_qty_str is not None:
-            try:
-                final_traded_qty = float(shioaji_deal_qty_str)
-            except ValueError:
-                self.write_log(f"無法轉換 Shioaji deal_quantity '{shioaji_deal_qty_str}' 為 float for order {vt_orderid}.", level="warning")
-
-        # 特別處理操作型回報 (如撤單成功/失敗)
-        operation_block = message.get("operation", {})
-        if isinstance(operation_block, dict):
-            op_type = operation_block.get("op_type")
-            op_code = operation_block.get("op_code")
-            op_msg = operation_block.get("op_msg")
-
-            if op_msg: # Operation message often more relevant
-                final_reference_msg = op_msg
-            
-            if op_type == "Cancel" and op_code == "00":
-                final_vn_status = Status.CANCELLED
-            elif op_code and op_code != "00": # Any operation that failed
-                # If it was a cancel op that failed, status might not change to REJECTED,
-                # it just means the cancel op itself failed. The order might still be active or filled.
-                # However, if it's a New order failing, then REJECTED is appropriate.
-                if op_type == "New":
-                    final_vn_status = Status.REJECTED
-                self.write_log(f"Shioaji operation '{op_type}' failed with code '{op_code}', msg: '{op_msg}' for order {vt_orderid}.", level="warning")
-
-
-        # 如果是成交事件 (StockDeal, FuturesDeal), 需要特別處理成交量和狀態
-        if state in [SjOrderState.StockDeal, SjOrderState.FuturesDeal]:
-            # 'message' for a deal usually contains info for *that specific deal*.
-            # The cumulative traded quantity needs to be tracked.
-            # Shioaji's 'deal_quantity' in the 'status' block of a deal message might be cumulative.
-            # If not, we need to sum up individual fills from the 'deals' list if present.
-            
-            deals_list = shioaji_status_block.get("deals", []) # 'deals' is usually a list in deal messages
-            if not deals_list and "price" in message and "quantity" in message: # Single deal structure
-                 deals_list = [message] 
-            
-            is_new_fill_processed = False
-            for deal_item in deals_list:
-                deal_price_str = deal_item.get("price")
-                deal_quantity_str = deal_item.get("quantity")
-                # Deal ID: prefer 'exchange_seq' or 'id' from deal_item, fallback to 'trade_id' from main message
-                shioaji_deal_id = deal_item.get("id") or deal_item.get("exchange_seq") or message.get("trade_id")
-                deal_ts_raw = deal_item.get("ts") # Timestamp of this specific deal
-
-                if deal_price_str is None or deal_quantity_str is None or shioaji_deal_id is None or deal_ts_raw is None:
-                    self.write_log(f"成交回報 (Order: {vt_orderid}) 缺少必要欄位 (price/quantity/id/ts): {deal_item}", level="warning")
-                    continue
-                
-                try:
-                    deal_price = float(deal_price_str)
-                    deal_quantity = float(deal_quantity_str)
-                except ValueError:
-                    self.write_log(f"無法轉換成交價格/數量為 float (Order: {vt_orderid}): P='{deal_price_str}', Q='{deal_quantity_str}'", level="warning")
-                    continue
-
-                if deal_quantity <= 0: # Skip zero or negative quantity fills
-                    continue
-
-                # ---- Prevent duplicate trade processing ----
-                # Key for shioaji_deals set: (shioaji_deal_id, shioaji_order_seqno)
-                deal_key = (str(shioaji_deal_id), str(seqno))
-                if deal_key in self.shioaji_deals:
-                    self.write_log(f"重複的成交回報 (Deal ID: {shioaji_deal_id}, Order: {vt_orderid})，已忽略。", level="debug")
-                    continue
-                self.shioaji_deals.add(deal_key)
-                # ---- End duplicate prevention ----
-
-                is_new_fill_processed = True
-
-                # Update cumulative traded quantity for the order
-                # Note: `final_traded_qty` might have already been updated from `shioaji_status_block.deal_quantity`.
-                # If `shioaji_status_block.deal_quantity` is reliably cumulative, this manual sum isn't needed.
-                # Assuming for now it might not be, or we want to be sure:
-                # current_order_total_traded = cached_order.traded + deal_quantity # This is wrong if multiple deals in one message
-                                                                              # and cached_order.traded isn't updated yet.
-                # Better: Use the `final_traded_qty` that was parsed from the status block, which SHOULD be cumulative.
-                # If the status block's deal_quantity is not cumulative, then:
-                # final_traded_qty = cached_order.traded + deal_quantity # if only one fill per message
-                # This part requires understanding if shioaji_status_block.deal_quantity in a DEAL message is cumulative or for that deal.
-                # Let's assume it IS cumulative as per modern API designs. So final_traded_qty is already set.
-
-                # Create TradeData object for this specific fill
-                trade_datetime: datetime
-                if isinstance(deal_ts_raw, (int, float)): # Timestamp in nanoseconds or similar
-                    trade_datetime = datetime.fromtimestamp(deal_ts_raw / 1e9, tz=TAIPEI_TZ)
-                elif isinstance(deal_ts_raw, datetime): # Already a datetime object
-                    trade_datetime = deal_ts_raw.replace(tzinfo=TAIPEI_TZ)
-                else:
-                    self.write_log(f"未知的成交時間戳格式 (Order: {vt_orderid}, Deal ID: {shioaji_deal_id}): {deal_ts_raw}", level="warning")
-                    trade_datetime = datetime.now(TAIPEI_TZ) # Fallback
-
-                vnpy_trade = TradeData(
-                    gateway_name=self.gateway_name,       # Handler's unique name
-                    accountid=self.vnpy_account_id,       # Handler's VnPy account ID
-                    symbol=cached_order.symbol,
-                    exchange=cached_order.exchange,
-                    orderid=cached_order.vt_orderid,      # Parent order's vt_orderid
-                    tradeid=f"{self.gateway_name}_{shioaji_deal_id}", # Ensure unique trade ID
-                    direction=cached_order.direction,     # Assume fill direction matches order
-                    offset=cached_order.offset,           # Assume fill offset matches order
-                    price=deal_price,
-                    volume=deal_quantity,
-                    datetime=trade_datetime
-                )
-                self.on_trade(vnpy_trade) # Send TradeData to manager
-                final_order_datetime = max(final_order_datetime, trade_datetime) # Order's last update time is at least this trade's time
-
-            # After processing all deals in the message, update order status based on cumulative traded quantity
-            if is_new_fill_processed: # Only if new fills were actually processed from this message
-                if final_traded_qty >= cached_order.volume:
-                    final_vn_status = Status.ALLTRADED
-                elif final_traded_qty > 0: # Must be > 0 if new fills
-                    final_vn_status = Status.PARTTRADED
-                # If final_traded_qty is 0 after processing "deals", something is wrong or no actual fill.
-
-        # 5. 更新 OrderData 快取並透過 Manager 發送更新
-        # Only push update if essential fields changed
-        if (final_vn_status != cached_order.status or
-            abs(final_traded_qty - cached_order.traded) > 1e-6 or # Compare floats carefully
-            final_reference_msg != cached_order.reference or
-            final_order_datetime != cached_order.datetime):
-
-            with self.order_map_lock: # Ensure atomic update of the cached order object
-                cached_order.status = final_vn_status
-                cached_order.traded = final_traded_qty
-                cached_order.reference = final_reference_msg
-                cached_order.datetime = final_order_datetime
-            
-            self.write_log(
-                f"推送訂單更新: {cached_order.vt_orderid}, VnPyStatus={cached_order.status}, "
-                f"TradedQty={cached_order.traded}, Ref='{cached_order.reference}'"
-            )
-            self.on_order(copy.copy(cached_order)) # Send a copy to manager
-        
-        elif state in [SjOrderState.Order, SjOrderState.Status]: # If it was just a status push without apparent change
-            self.write_log(f"收到 Shioaji 訂單狀態 '{shioaji_native_status_str}', VnPy 狀態無變化 ({final_vn_status}) for {vt_orderid}", level="debug")
-
-
-# Inside ShioajiSessionHandler class:
-
     def _contracts_cb(self, security_type: SjSecurityType) -> None:
         """合約下載進度回調。"""
         timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
@@ -2794,7 +2530,7 @@ class ShioajiSessionHandler(BaseGateway):
                 option_pricetick = 0.1 # This depends on strike price ranges for TXO. Be careful with fixed values.
 
             cd = ContractData(
-                gateway_name=self.gateway_name, # <<< MODIFIED: Use handler's specific gateway_name
+                gateway_name=self.manager_gateway_name,
                 symbol=sjc.code,
                 exchange=vn_exchange,
                 name=sjc.name,
@@ -2930,7 +2666,7 @@ class ShioajiSessionHandler(BaseGateway):
                     # Add more overrides as needed: TE, TF, GDF, XIF, etc.
 
                 cd = ContractData(
-                    gateway_name=self.gateway_name, # Handler's specific name
+                    gateway_name=self.manager_gateway_name, # Handler's specific name
                     symbol=code,
                     exchange=vn_exchange,
                     name=sj_fut_contract.name,
@@ -2982,7 +2718,7 @@ class ShioajiSessionHandler(BaseGateway):
                         # Add checks for Product.WARRANT if Shioaji provides enough info
 
                         cd = ContractData(
-                            gateway_name=self.gateway_name, # Handler's specific name
+                            gateway_name=self.manager_gateway_name, # Handler's specific name
                             symbol=code,
                             exchange=vnpy_exchange_enum, # Use the mapped VnPy enum for this category
                             name=sj_stk_contract.name,
@@ -3037,12 +2773,96 @@ class ShioajiSessionHandler(BaseGateway):
         self.write_log(f"完成處理合約 for Handler {self.gateway_name}. 推送 {final_contract_count} 檔合約 (共解析 {len(parsed_contracts_tmp)} 檔)。")
 
     def query_history(self, req: HistoryRequest) -> Optional[List[BarData]]:
-        # Queries history using THIS handler's API.
-        # BarData objects should have `gateway_name = self.gateway_name`.
-        # This method, if called directly on handler, returns List[BarData].
-        # The manager might call this and then forward the data.
-        # ... (full implementation adapted from your original) ...
-        return None # Placeholder
+        """
+        Queries historical bar data from this handler's Shioaji session.
+        This method is the worker that calls the API.
+        """
+        # 1. 連線檢查
+        if not self._check_connection():
+            self.write_log(f"Handler {self.gateway_name}: Cannot query history for {req.vt_symbol}, not connected.", level="warning")
+            return None
+
+        self.write_log(
+            f"Handler {self.gateway_name}: History query for {req.vt_symbol} "
+            f"from {req.start.strftime('%Y-%m-%d %H:%M:%S')} to {req.end.strftime('%Y-%m-%d %H:%M:%S')}, Interval: {req.interval.value}"
+        )
+
+        # 2. 獲取合約物件
+        sj_contract = self.find_sj_contract(req.symbol, req.exchange.value)
+        if not sj_contract:
+            self.write_log(f"Handler {self.gateway_name}: Contract {req.vt_symbol} not found for history query.", level="warning")
+            return None
+
+        # 3. 目前只支援分鐘K線
+        if req.interval != Interval.MINUTE:
+            self.write_log(
+                f"Handler {self.gateway_name}: Shioaji api.kbars only supports 1-minute interval. "
+                f"Requested interval '{req.interval.value}' is not supported.",
+                level="error"
+            )
+            return None
+
+        # 4. 呼叫 Shioaji API
+        start_date_str = req.start.strftime("%Y-%m-%d")
+        end_date_str = req.end.strftime("%Y-%m-%d")
+        bars: List[BarData] = []
+
+        try:
+            self.write_log(f"Handler {self.gateway_name}: Calling Shioaji api.kbars for {sj_contract.code} from {start_date_str} to {end_date_str}.")
+            
+            shioaji_kbars_obj: Optional[SjKbars] = self.api.kbars(
+                contract=sj_contract,
+                start=start_date_str,
+                end=end_date_str
+            )
+
+            # 5. 解析返回的數據
+            if not isinstance(shioaji_kbars_obj, SjKbars):
+                self.write_log(f"Handler {self.gateway_name}: Shioaji api.kbars did not return a Kbars object for {req.vt_symbol}.", level="info")
+                return []
+
+            df = pd.DataFrame({**shioaji_kbars_obj})
+            if df.empty:
+                return []
+
+            # 6. 數據清洗與轉換
+            required_columns = ['ts', 'Open', 'High', 'Low', 'Close', 'Volume']
+            if not all(col in df.columns for col in required_columns):
+                self.write_log(f"Handler {self.gateway_name}: Shioaji kbars DataFrame is missing required columns.", level="error")
+                return None
+            
+            df['datetime'] = pd.to_datetime(df['ts'], unit='ns').dt.tz_localize('Asia/Taipei') # 假設 ts 是秒級時間戳
+            df.dropna(inplace=True)
+
+            for _, row in df.iterrows():
+                bar_time = row['datetime'].to_pydatetime()
+                # 篩選請求的時間範圍
+                if not (req.start <= bar_time < req.end):
+                    continue
+
+                bar = BarData(
+                    gateway_name=self.manager_gateway_name,
+                    symbol=req.symbol,
+                    exchange=req.exchange,
+                    datetime=bar_time + timedelta(minutes=1), # VnPy K線時間戳是結束時間
+                    interval=req.interval,
+                    volume=float(row["Volume"]),
+                    open_price=float(row["Open"]),
+                    high_price=float(row["High"]),
+                    low_price=float(row["Low"]),
+                    close_price=float(row["Close"]),
+                    turnover=float(row.get("Amount", 0.0)),
+                    open_interest=0
+                )
+                bars.append(bar)
+            
+            self.write_log(f"Handler {self.gateway_name}: History query for {req.vt_symbol} processed {len(bars)} bars.")
+            return bars
+
+        except Exception as e:
+            self.write_log(f"Handler {self.gateway_name}: Critical error during Shioaji history query for {req.vt_symbol}: {e}", level="critical")
+            return None
+
 
     def cancel_order(self, req: CancelRequest) -> None:
         """
@@ -3070,7 +2890,7 @@ class ShioajiSessionHandler(BaseGateway):
         # vt_orderid 格式預期為 "HANDLER_GATEWAY_NAME.SHIOAJI_SEQNO"
         # 例如: "SHIOAJI_MULTI.ACCOUNT1.S0000123"
         parts = vt_orderid_to_cancel.split('.')
-        if not (len(parts) >= 2 and vt_orderid_to_cancel.startswith(self.gateway_name)):
+        if not (len(parts) >= 2 and vt_orderid_to_cancel.startswith(self.manager_gateway_name)):
             self.write_log(
                 f"撤單請求 {vt_orderid_to_cancel} 失敗: OrderID 格式不正確或與 Handler ({self.gateway_name}) 不匹配。",
                 level="error"

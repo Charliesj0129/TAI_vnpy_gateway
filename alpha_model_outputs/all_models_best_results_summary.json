@@ -1,0 +1,66 @@
+[
+    {
+        "model_type": "Lasso",
+        "best_params": {
+            "alpha": 1e-07,
+            "max_iter": 2000,
+            "random_state": null
+        },
+        "validation_rmse": 0.002271511415307229,
+        "test_rmse": 0.0029040767637631424,
+        "test_predictions_head": [
+            -0.0033058980833305025,
+            0.001644878020598679,
+            0.0016302021539069292,
+            0.0013663835380803239,
+            0.0017671495928667873
+        ]
+    },
+    {
+        "model_type": "LightGBM",
+        "best_params": {
+            "learning_rate": 0.005,
+            "num_leaves": 1023,
+            "num_boost_round": 500,
+            "early_stopping_rounds": 100,
+            "log_evaluation_period": 20,
+            "seed": null
+        },
+        "validation_rmse": 0.002245500253522193,
+        "test_rmse": 0.0027952643810147063,
+        "test_predictions_head": [
+            -0.004336186824174583,
+            0.00027821369936124684,
+            0.0008412869359940295,
+            0.00045590602721601423,
+            0.0005282668666762222
+        ]
+    },
+    {
+        "model_type": "MLP",
+        "best_params": {
+            "input_size": 158,
+            "hidden_sizes": [
+                128
+            ],
+            "lr": 0.001,
+            "n_epochs": 1000,
+            "batch_size": 30000,
+            "early_stop_rounds": 10,
+            "eval_steps": 50,
+            "optimizer": "adam",
+            "weight_decay": 0.001,
+            "device": "cpu",
+            "seed": null
+        },
+        "validation_rmse": 0.010310780442935133,
+        "test_rmse": 0.010741526888885872,
+        "test_predictions_head": [
+            0.017740730196237564,
+            -0.0006181597709655762,
+            0.016653990373015404,
+            0.0008922703564167023,
+            -1.5448778867721558e-05
+        ]
+    }
+]

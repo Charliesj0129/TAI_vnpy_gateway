@@ -2,7 +2,7 @@ import os
 import re
 import zipfile
 import pandas as pd
-from datetime import datetime, timedelta
+from datetime import datetime
 from io import StringIO
 import sqlite3
 from zoneinfo import ZoneInfo # Python 3.9+
@@ -207,7 +207,7 @@ def process_single_zip_file_target_futures(zip_f:str, db_conn:sqlite3.Connection
     if not all_dfs: logging.info(f"ZIP {zip_fn}:未提取到有效Ticks({TARGET_PRODUCTS})"); return 0,0
     combo_df=pd.concat(all_dfs,ignore_index=True); total_ticks=len(combo_df)
     logging.info(f"ZIP {zip_fn}:共合併{total_ticks}筆{TARGET_PRODUCTS}Ticks,準備聚合...")
-    bars=aggregate_ticks_to_bars(combo_df);
+    bars=aggregate_ticks_to_bars(combo_df)
     if not bars.empty and db_conn:
         saved_bars=save_bars_to_sqlite(db_conn,bars)
         saved_bars=saved_bars if saved_bars>=0 else 0
