@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from threading import Timer
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
+from adapters.fubon_to_vnpy import MarketEnvelopeNormalizer
 from .account import AccountAPI
 from .fubon_connect import FubonAPIConnector, create_authenticated_client
 from .logging_config import configure_logging
@@ -47,6 +48,10 @@ from .vnpy_compat import (
     Interval,
 )
 
+try:  # pragma: no cover - optional SDK dependency
+    from fubon_neo.sdk import Mode
+except ImportError:  # pragma: no cover - graceful degradation
+    Mode = None  # type: ignore[assignment]
 
 class FubonGateway(BaseGateway):
     """
@@ -103,6 +108,8 @@ class FubonGateway(BaseGateway):
         self._ws_sdk_callbacks: list[Tuple[str, Callable[..., None]]] = []
         self._token_timer: Optional[Timer] = None
         self._token_refresh_interval = 900  # seconds; aligns with 15-minute default heartbeat
+        self._market_normalizer: Optional[MarketEnvelopeNormalizer] = None
+        self._preferred_ws_mode = os.getenv("FUBON_REALTIME_MODE", "Normal")
 
     # ----------------------------------------------------------------------
     # vn.py BaseGateway interface
@@ -471,6 +478,140 @@ class FubonGateway(BaseGateway):
 
         _walk(response)
         return parsed
+
+    def _get_market_normalizer(self) -> MarketEnvelopeNormalizer:
+        if self._market_normalizer is None:
+            self._market_normalizer = MarketEnvelopeNormalizer(gateway_name=self.gateway_name)
+        return self._market_normalizer
+
+    def _normalize_market_trade(self, payload: Mapping[str, Any]) -> Optional[TradeData]:
+        try:
+            normalizer = self._get_market_normalizer()
+            normalized = normalizer.normalize_trade(payload)
+        except Exception as exc:
+            self.logger.debug("Failed to normalize trade payload %s: %s", payload, exc)
+            return None
+        trade = normalized.trade
+        trade.gateway_name = self.gateway_name
+        trade.extra = getattr(trade, "extra", {}) or {}
+        trade.extra["source"] = "market"
+        trade.extra["channel"] = normalized.raw.channel
+        trade.extra["latency_ms"] = normalized.raw.latency_ms
+        return trade
+
+    def _normalize_market_bar(self, payload: Mapping[str, Any]) -> Optional[BarData]:
+        source: Mapping[str, Any]
+        data_field = payload.get("data")
+        if isinstance(data_field, Mapping):
+            source = data_field
+        else:
+            source = payload
+
+        symbol = str(source.get("symbol") or "").strip()
+        if not symbol:
+            return None
+
+        exchange_code = source.get("exchange") or source.get("market") or self._default_exchange_code
+        exchange = normalize_exchange(exchange_code, default=self._default_exchange_code)
+        dt = self._parse_ws_datetime(
+            source.get("date") or source.get("timestamp") or source.get("time") or source.get("datetime")
+        ) or datetime.now(timezone.utc)
+
+        timeframe = source.get("timeframe") or source.get("interval")
+        interval: Optional[Interval] = None
+        try:
+            if isinstance(timeframe, (int, float)):
+                if timeframe == 1:
+                    interval = getattr(Interval, "MINUTE", None)
+                elif timeframe == 5:
+                    interval = getattr(Interval, "MINUTE", None)
+                elif timeframe in (15, 30):
+                    interval = getattr(Interval, "MINUTE", None)
+                elif timeframe == 60:
+                    interval = getattr(Interval, "HOUR", None)
+                elif timeframe >= 1440:
+                    interval = getattr(Interval, "DAILY", None)
+            elif isinstance(timeframe, str):
+                mapping = {
+                    "1m": getattr(Interval, "MINUTE", None),
+                    "5m": getattr(Interval, "MINUTE", None),
+                    "15m": getattr(Interval, "MINUTE", None),
+                    "30m": getattr(Interval, "MINUTE", None),
+                    "1h": getattr(Interval, "HOUR", None),
+                    "1d": getattr(Interval, "DAILY", None),
+                    "d": getattr(Interval, "DAILY", None),
+                }
+                interval = mapping.get(timeframe.lower())
+        except Exception:
+            interval = getattr(Interval, "MINUTE", None)
+        if interval is None:
+            interval = getattr(Interval, "MINUTE", None)
+
+        open_price = self._safe_float(source.get("open"))
+        high_price = self._safe_float(source.get("high"))
+        low_price = self._safe_float(source.get("low"))
+        close_price = self._safe_float(source.get("close"))
+        volume = self._safe_float(source.get("volume"))
+        turnover = self._safe_float(source.get("turnover"))
+        open_interest = self._safe_float(source.get("openInterest"))
+
+        bar = BarData(
+            gateway_name=self.gateway_name,
+            symbol=symbol,
+            exchange=exchange,
+            datetime=dt,
+            interval=interval,
+            volume=volume,
+            turnover=turnover,
+            open_interest=open_interest,
+            open_price=open_price,
+            high_price=high_price,
+            low_price=low_price,
+            close_price=close_price,
+        )
+        return bar
+
+    def _safe_float(self, value: Any, default: float = 0.0) -> float:
+        if value in (None, "", "null"):
+            return default
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    def _parse_ws_datetime(self, value: Any) -> Optional[datetime]:
+        if isinstance(value, datetime):
+            return value
+        if isinstance(value, (int, float)):
+            try:
+                return datetime.fromtimestamp(value, tz=timezone.utc)
+            except (OverflowError, OSError, ValueError):
+                return None
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return None
+            try:
+                if text.endswith("Z"):
+                    text = text[:-1] + "+00:00"
+                return datetime.fromisoformat(text)
+            except ValueError:
+                for fmt in ("%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S", "%Y%m%d%H%M%S"):
+                    try:
+                        return datetime.strptime(text, fmt).replace(tzinfo=timezone.utc)
+                    except ValueError:
+                        continue
+        return None
+
+    def _resolve_ws_mode(self) -> Optional[Any]:
+        mode_value = (self._preferred_ws_mode or "").strip()
+        if not mode_value:
+            return None
+        if Mode is not None:
+            for member in Mode:
+                if str(member.name).lower() == mode_value.lower():
+                    return member
+        return mode_value
 
     def query_account(self) -> Optional[AccountData]:
         if not self.account_api:
@@ -925,15 +1066,34 @@ class FubonGateway(BaseGateway):
 
         init_method = getattr(self.client, "init_realtime", None)
         if callable(init_method):
-            try:
-                init_method()
-            except TypeError:
+            mode_candidates: list[Any] = []
+            resolved_mode = self._resolve_ws_mode()
+            if resolved_mode is not None:
+                mode_candidates.append(resolved_mode)
+            mode_candidates.append(None)
+            initialised = False
+            for candidate in mode_candidates:
                 try:
-                    init_method(mode=None)
+                    if candidate is None:
+                        init_method()
+                    else:
+                        init_method(candidate)
+                    initialised = True
+                    break
+                except TypeError:
+                    try:
+                        if candidate is None:
+                            init_method(mode=None)
+                        else:
+                            init_method(mode=candidate)
+                        initialised = True
+                        break
+                    except Exception as exc:
+                        self.logger.debug("init_realtime(mode=%s) failed: %s", candidate, exc)
                 except Exception as exc:
-                    self.logger.debug("init_realtime(mode=None) failed: %s", exc)
-            except Exception as exc:
-                self.logger.debug("init_realtime() failed: %s", exc)
+                    self.logger.debug("init_realtime(%s) failed: %s", candidate, exc)
+            if not initialised:
+                self.logger.debug("Unable to initialise realtime market data; continuing without explicit mode.")
 
     def _ensure_websocket_client(self, *, register_handler: bool = False) -> Any:
         if self.client is None:
@@ -1305,10 +1465,23 @@ class FubonGateway(BaseGateway):
             if event.channel and "channel" not in payload:
                 payload["channel"] = event.channel
             payload.setdefault("event_type", event.event_type)
-            self._put_event(EVENT_FUBON_MARKET_RAW, payload)
+
+            channel = (event.channel or "").lower()
             if event.event_type == "orderbook" and event.tick:
                 event.tick.gateway_name = self.gateway_name
+                payload["tick"] = event.tick
                 self._put_event(EVENT_TICK, event.tick)
+            else:
+                if channel in {"trades", "trade"} or event.event_type == "trade":
+                    trade = self._normalize_market_trade(event.payload)
+                    if trade:
+                        payload["trade"] = trade
+                elif channel in {"candles", "candle", "aggregates", "aggregate"}:
+                    bar = self._normalize_market_bar(event.payload)
+                    if bar:
+                        payload["bar"] = bar
+
+            self._put_event(EVENT_FUBON_MARKET_RAW, payload)
 
     def _handle_ws_disconnect(self, *args: Any, **kwargs: Any) -> None:
         if self._closing:

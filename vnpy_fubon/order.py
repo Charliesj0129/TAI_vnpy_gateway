@@ -170,8 +170,22 @@ class OrderAPI:
         return orders
 
     def query_trades(self, **kwargs: Any) -> List[TradeData]:
+        futopt = getattr(self.client, "futopt", None)
+        filled_history = getattr(futopt, "filled_history", None) if futopt else None
+        if callable(filled_history):
+            trades = self._query_trades_via_futopt(filled_history, kwargs)
+            if trades is not None:
+                return trades
+
+        normalized_kwargs = dict(kwargs)
+        market_type_value = normalized_kwargs.get("market_type") or normalized_kwargs.get("marketType")
+        coerced_market_type = self._coerce_market_type(market_type_value)
+        if coerced_market_type is not None:
+            normalized_kwargs["market_type"] = coerced_market_type
+            normalized_kwargs.pop("marketType", None)
+
         method = self._resolve_method(QUERY_TRADE_METHODS)
-        response = method(**kwargs)
+        response = method(**normalized_kwargs)
         trades: List[TradeData] = []
         entries: Iterable[Mapping[str, Any]]
         if isinstance(response, Mapping):
@@ -237,6 +251,54 @@ class OrderAPI:
         order_data = self._to_order_data(order_payload, payload)
         self.logger.info("Order placed via FutOpt: %s (raw=%s)", order_data, response)
         return order_data
+
+    def _query_trades_via_futopt(self, method: Any, params: Mapping[str, Any]) -> Optional[List[TradeData]]:
+        account_obj = self._get_sdk_account(params.get("account"), params.get("account_id"))
+        if account_obj is None:
+            return None
+        start_date = params.get("start_date") or params.get("startDate")
+        if not start_date:
+            return None
+        end_date = params.get("end_date") or params.get("endDate")
+        market_type = params.get("market_type") or params.get("marketType")
+        market_type = self._coerce_market_type(market_type)
+        if market_type is None and FutOptMarketType is not None:
+            market_type = getattr(FutOptMarketType, "Future", None)
+        if market_type is None:
+            market_type = "Future"
+
+        try:
+            if end_date is not None:
+                response = method(account_obj, market_type, start_date, end_date)
+            else:
+                response = method(account_obj, market_type, start_date)
+        except TypeError:
+            try:
+                response = method(account_obj, market_type, start_date, end_date)
+            except Exception as exc:
+                self.logger.debug(
+                    "FutOpt filled_history invocation failed with params %s: %s",
+                    params,
+                    exc,
+                    exc_info=True,
+                )
+                return None
+        except Exception as exc:
+            self.logger.debug(
+                "FutOpt filled_history raised for params %s: %s",
+                params,
+                exc,
+                exc_info=True,
+            )
+            return None
+
+        trades: List[TradeData] = []
+        for entry in self._extract_trade_entries(response):
+            try:
+                trades.append(self._to_trade_data(entry))
+            except Exception as exc:
+                self.logger.debug("Failed to map trade payload %s: %s", entry, exc)
+        return trades
 
     def _cancel_order_via_futopt(
         self,
@@ -406,16 +468,23 @@ class OrderAPI:
 
     def _map_market_type(self, payload: Mapping[str, Any], symbol: str) -> Any:
         code = payload.get("market_type") or payload.get("marketType")
-        if FutOptMarketType is None:
-            return code or "Future"
-        candidate = self._enum_member(FutOptMarketType, code)
-        if candidate:
-            return candidate
+        coerced = self._coerce_market_type(code)
+        if coerced is not None and FutOptMarketType is not None and isinstance(coerced, FutOptMarketType):  # type: ignore[arg-type]
+            return coerced
 
         # Heuristic based on symbol prefix for options (commonly contain alphabetic suffix)
+        if FutOptMarketType is None:
+            return code or "Future"
+
         if symbol.upper().startswith(("TXO", "TFO", "XO", "O")):
             return getattr(FutOptMarketType, "Option", None)
         return getattr(FutOptMarketType, "Future", None)
+
+    def _coerce_market_type(self, value: Any) -> Any:
+        if value is None or FutOptMarketType is None:
+            return value
+        coerced = self._enum_member(FutOptMarketType, value)
+        return coerced or value
 
     def _enum_member(self, enum_cls: Any, value: Any) -> Optional[Any]:
         if enum_cls is None or value is None:
@@ -451,6 +520,10 @@ class OrderAPI:
                 if isinstance(first, Mapping):
                     return first
         return response
+
+    def _extract_trade_entries(self, payload: Any) -> List[Mapping[str, Any]]:
+        entries = self._extract_order_entries(payload)
+        return [entry for entry in entries if isinstance(entry, Mapping)]
 
     def _get_sdk_account(self, account: Any = None, account_id: Optional[str] = None) -> Optional[Any]:
         if account is not None:
