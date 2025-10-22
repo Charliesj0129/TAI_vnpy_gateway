@@ -7,7 +7,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
-from typing import Any, Iterable, List, Mapping, Optional
+from typing import Any, Dict, Iterable, List, Mapping, Optional
 
 from .exceptions import FubonSDKMethodNotFoundError
 from .mappings import (
@@ -80,6 +80,7 @@ class OrderAPI:
         client: Any,
         *,
         account_id: Optional[str] = None,
+        account_lookup: Optional[Mapping[str, Any]] = None,
         gateway_name: str = "Fubon",
         logger: Optional[logging.Logger] = None,
     ) -> None:
@@ -87,6 +88,16 @@ class OrderAPI:
         self.account_id = account_id
         self.gateway_name = gateway_name
         self.logger = logger or LOGGER
+        self.account_lookup: Dict[str, Any] = {
+            str(key): value for key, value in (account_lookup or {}).items()
+        }
+
+    def set_account_lookup(self, accounts: Mapping[str, Any]) -> None:
+        """
+        Register SDK account objects so downstream calls can provide them to the SDK.
+        """
+
+        self.account_lookup = {str(key): value for key, value in accounts.items()}
 
     def place_order(
         self,
@@ -105,15 +116,19 @@ class OrderAPI:
         return order_data
 
     def cancel_order(self, order_id: str, **kwargs: Any) -> bool:
+        futopt = getattr(self.client, "futopt", None)
+        futopt_cancel = getattr(futopt, "cancel_order", None) if futopt else None
+        if callable(futopt_cancel):
+            bridge_result = self._cancel_order_via_futopt(futopt_cancel, order_id, dict(kwargs))
+            if bridge_result is not None:
+                return bridge_result
+
         method = self._resolve_method(CANCEL_ORDER_METHODS)
         payload = {"order_id": order_id}
         payload.update(kwargs)
         self.logger.debug("Cancelling order %s with payload %s", order_id, payload)
         response = method(**payload)
-        if isinstance(response, Mapping):
-            result = bool(response.get("result") or response.get("success") or response.get("status") == 0)
-        else:
-            result = bool(response)
+        result = self._interpret_response_success(response)
         self.logger.info("Cancel result for %s -> %s (raw=%s)", order_id, result, response)
         return result
 
@@ -152,6 +167,220 @@ class OrderAPI:
         raise FubonSDKMethodNotFoundError(
             f"OrderAPI cannot find any of {candidates} on client {type(self.client).__name__}"
         )
+
+    def _cancel_order_via_futopt(
+        self,
+        cancel_method: Any,
+        order_id: str,
+        params: Mapping[str, Any],
+    ) -> Optional[bool]:
+        account_obj = self._get_sdk_account(params.get("account"), params.get("account_id"))
+        if account_obj is None:
+            account_obj = self._get_sdk_account()
+        if account_obj is None:
+            self.logger.debug(
+                "Unable to resolve account object for cancel_order %s; falling back to order_id signature.",
+                order_id,
+            )
+            return None
+
+        order_result = params.get("order_result")
+        if order_result is None:
+            futopt = getattr(cancel_method, "__self__", None)
+            order_result = self._find_sdk_order_result_by_id(futopt, account_obj, order_id, params)
+
+        if order_result is None:
+            self.logger.debug(
+                "FutOpt order_result not found for cancel_order %s; falling back to order_id signature.",
+                order_id,
+            )
+            return None
+
+        unblock = params.get("unblock")
+        try:
+            if unblock is not None:
+                response = cancel_method(account_obj, order_result, unblock=unblock)
+            else:
+                response = cancel_method(account_obj, order_result)
+        except TypeError:
+            try:
+                if unblock is not None:
+                    response = cancel_method(account_obj, order_result, unblock)
+                else:
+                    response = cancel_method(account_obj, order_result)
+            except Exception as exc:
+                self.logger.debug(
+                    "FutOpt cancel_order invocation failed for %s: %s",
+                    order_id,
+                    exc,
+                    exc_info=True,
+                )
+                return None
+        except Exception as exc:
+            self.logger.warning("FutOpt cancel_order raised for %s: %s", order_id, exc)
+            raise
+
+        result = self._interpret_response_success(response)
+        self.logger.info("Cancel result for %s -> %s (raw=%s)", order_id, result, response)
+        return result
+
+    def _get_sdk_account(self, account: Any = None, account_id: Optional[str] = None) -> Optional[Any]:
+        if account is not None:
+            return account
+        candidate_id = account_id or self.account_id
+        if candidate_id:
+            candidate = self.account_lookup.get(str(candidate_id))
+            if candidate is not None:
+                return candidate
+        if len(self.account_lookup) == 1:
+            return next(iter(self.account_lookup.values()))
+        return None
+
+    def _find_sdk_order_result_by_id(
+        self,
+        futopt: Any,
+        account_obj: Any,
+        order_id: str,
+        params: Mapping[str, Any],
+    ) -> Optional[Any]:
+        if futopt is None:
+            return None
+        getter = getattr(futopt, "get_order_results", None)
+        if not callable(getter):
+            return None
+
+        market_type = params.get("market_type") or params.get("marketType")
+        try:
+            if market_type is not None:
+                response = getter(account_obj, market_type=market_type)
+            else:
+                response = getter(account_obj)
+        except TypeError:
+            try:
+                response = getter(account_obj, market_type)
+            except Exception:
+                response = getter(account_obj)
+        except Exception as exc:
+            self.logger.debug(
+                "get_order_results failed for account %s while cancelling order %s: %s",
+                account_obj,
+                order_id,
+                exc,
+                exc_info=True,
+            )
+            return None
+
+        order_id_str = str(order_id).strip()
+        if not order_id_str:
+            return None
+
+        for entry in self._extract_order_entries(response):
+            entry_id = self._extract_order_id(entry)
+            if entry_id and entry_id == order_id_str:
+                return entry
+        return None
+
+    def _extract_order_entries(self, payload: Any) -> List[Any]:
+        if payload is None:
+            return []
+
+        if isinstance(payload, Mapping):
+            for key in ("data", "orders", "result", "results"):
+                nested = payload.get(key)
+                if nested is not None:
+                    return self._extract_order_entries(nested)
+            return [payload]
+
+        data_attr = getattr(payload, "data", None)
+        if data_attr is not None:
+            return self._extract_order_entries(data_attr)
+
+        if isinstance(payload, (list, tuple, set)):
+            entries: List[Any] = []
+            for item in payload:
+                entries.extend(self._extract_order_entries(item))
+            return entries
+
+        return [payload]
+
+    def _extract_order_id(self, entry: Any) -> Optional[str]:
+        if entry is None:
+            return None
+
+        candidates = (
+            "order_id",
+            "orderId",
+            "orderid",
+            "ord_no",
+            "ordNo",
+            "order_no",
+            "orderNo",
+            "seq_no",
+            "seqNo",
+            "id",
+        )
+
+        if isinstance(entry, Mapping):
+            for key in candidates:
+                if key in entry and entry[key] not in (None, ""):
+                    return str(entry[key]).strip()
+
+        for key in candidates:
+            try:
+                value = getattr(entry, key)
+            except Exception:
+                continue
+            if value not in (None, ""):
+                return str(value).strip()
+
+        return None
+
+    def _interpret_response_success(self, response: Any) -> bool:
+        if isinstance(response, Mapping):
+            for key in ("success", "is_success", "result", "status", "code"):
+                if key not in response:
+                    continue
+                success = self._normalize_success_value(response[key])
+                if success is not None:
+                    return success
+            return bool(response)
+
+        for attr in ("is_success", "success", "result", "status", "code"):
+            if hasattr(response, attr):
+                try:
+                    success = self._normalize_success_value(getattr(response, attr))
+                except Exception:
+                    success = None
+                if success is not None:
+                    return success
+
+        return bool(response)
+
+    @staticmethod
+    def _normalize_success_value(value: Any) -> Optional[bool]:
+        if value in (None, "", "null"):
+            return None
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            if value == 0:
+                return True
+            if value == 1:
+                return True
+            return None
+        if isinstance(value, str):
+            text = value.strip().lower()
+            if not text:
+                return None
+            if text in {"ok", "success", "true", "yes", "y"}:
+                return True
+            if text in {"fail", "failed", "false", "error", "no", "n"}:
+                return False
+            if text == "0":
+                return True
+            if text == "1":
+                return True
+        return None
 
     def _build_order_payload(self, request: OrderRequest | Mapping[str, Any]) -> dict[str, Any]:
         if isinstance(request, OrderRequest):

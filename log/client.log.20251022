@@ -121,3 +121,9 @@
 [2025-10-22 19:37:00.616112900 +08:00 INFO] [future_option_mapping]: 116.0633ms
 [2025-10-22 19:37:00.652063900 +08:00 INFO] [future_option_mapping]: 24.2702ms
 [2025-10-22 20:06:55.383862 +08:00 INFO] [logout] user manually logout
+[2025-10-22 20:07:34.644348500 +08:00 INFO] [login] personal_id="M220596582"
+[2025-10-22 20:07:34.704431600 +08:00 INFO] this account require 2fa
+[2025-10-22 20:07:34.767240700 +08:00 INFO] [future_option_mapping]: 47.4561ms
+[2025-10-22 20:07:34.780832700 +08:00 INFO] [future_option_mapping]: 12.1421ms
+[2025-10-22 20:07:34.848953 +08:00 INFO] [future_option_mapping]: 67.8687ms
+[2025-10-22 20:07:34.887857800 +08:00 INFO] [future_option_mapping]: 32.559ms

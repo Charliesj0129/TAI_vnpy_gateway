@@ -94,6 +94,8 @@ class FubonGateway(BaseGateway):
         self._ws_handlers_registered = False
         self._ws_registered_events: list[Tuple[str, Callable[..., None]]] = []
         self._active_subscriptions: Set[Tuple[str, str, Optional[bool]]] = set()
+        self._subscription_ids_by_key: Dict[Tuple[str, str, Optional[bool]], str] = {}
+        self._subscription_key_by_id: Dict[str, Tuple[str, str, Optional[bool]]] = {}
         self._ws_reconnect_attempts = 0
         self._ws_reconnect_timer: Optional[Timer] = None
         self._closing = False
@@ -142,11 +144,14 @@ class FubonGateway(BaseGateway):
         self.order_api = OrderAPI(
             self.client,
             account_id=self.primary_account_id,
+            account_lookup=self.account_map,
             gateway_name=self.gateway_name,
             logger=self.logger,
         )
         if self.primary_account_id:
             self.order_api.account_id = self.primary_account_id
+        if self.order_api:
+            self.order_api.set_account_lookup(self.account_map)
         self.market_api = MarketAPI(self.client, gateway_name=self.gateway_name, logger=self.logger)
 
         self._register_order_callbacks()
@@ -175,6 +180,8 @@ class FubonGateway(BaseGateway):
         self.contracts.clear()
         self._symbol_aliases.clear()
         self._symbol_exchange_aliases.clear()
+        self._subscription_ids_by_key.clear()
+        self._subscription_key_by_id.clear()
         self.write_log("Fubon gateway closed.", state="closed")
         self._closing = False
 
@@ -190,26 +197,69 @@ class FubonGateway(BaseGateway):
     ) -> None:
         client = self._ensure_websocket_client(register_handler=True)
         payload_channels = list(channels or ("books",))
-        for symbol in symbols:
-            for channel in payload_channels:
-                key = (channel, symbol, after_hours)
-                if key in self._active_subscriptions:
-                    continue
+
+        unique_symbols: list[str] = []
+        for raw_symbol in symbols:
+            symbol = str(raw_symbol).strip()
+            if not symbol:
+                continue
+            if symbol not in unique_symbols:
+                unique_symbols.append(symbol)
+
+        if not unique_symbols:
+            return
+
+        for channel in payload_channels:
+            pending_symbols = [
+                symbol
+                for symbol in unique_symbols
+                if (channel, symbol, after_hours) not in self._active_subscriptions
+            ]
+            if not pending_symbols:
+                continue
+
+            batch_completed = False
+            if len(pending_symbols) > 1:
+                batch_message = {"channel": channel, "symbols": pending_symbols}
+                if after_hours is not None:
+                    batch_message["afterHours"] = bool(after_hours)
+                try:
+                    response = client.subscribe(batch_message)
+                except TypeError:
+                    self.logger.debug(
+                        "Batch subscribe unsupported for payload %s; falling back to per-symbol requests.",
+                        batch_message,
+                        exc_info=True,
+                    )
+                except Exception as exc:
+                    self.logger.warning(
+                        "Batch subscribe failed for %s: %s",
+                        batch_message,
+                        exc,
+                        extra={
+                            "channel": channel,
+                            "gateway_state": "subscribe_failed",
+                        },
+                    )
+                    if self._should_reconnect_after_error(exc):
+                        self._schedule_ws_reconnect()
+                    else:
+                        self._put_event(EVENT_LOG, f"Subscription rejected for {batch_message}: {exc}")
+                else:
+                    parsed_ids = self._parse_subscription_ids(response, pending_symbols)
+                    id_map = {symbol: parsed_ids.get(symbol) for symbol in pending_symbols}
+                    self._register_subscriptions(channel, id_map, after_hours)
+                    batch_completed = True
+
+            if batch_completed:
+                continue
+
+            for symbol in pending_symbols:
                 message = {"channel": channel, "symbol": symbol}
                 if after_hours is not None:
                     message["afterHours"] = bool(after_hours)
                 try:
-                    client.subscribe(message)
-                    self._active_subscriptions.add(key)
-                    self.logger.debug(
-                        "Subscribed websocket channel %s",
-                        message,
-                        extra={
-                            "channel": channel,
-                            "symbol": symbol,
-                            "gateway_state": "subscribed",
-                        },
-                    )
+                    response = client.subscribe(message)
                 except Exception as exc:
                     self.logger.warning(
                         "Subscribe failed for %s: %s",
@@ -226,6 +276,9 @@ class FubonGateway(BaseGateway):
                     else:
                         self._put_event(EVENT_LOG, f"Subscription rejected for {message}: {exc}")
                     raise
+                parsed_ids = self._parse_subscription_ids(response, [symbol])
+                id_map = {symbol: parsed_ids.get(symbol)}
+                self._register_subscriptions(channel, id_map, after_hours)
 
     def unsubscribe_quotes(
         self,
@@ -237,7 +290,15 @@ class FubonGateway(BaseGateway):
         if not self._ws_client:
             return
         payload_channels = list(channels or ("books",))
-        for symbol in symbols:
+        unique_symbols: list[str] = []
+        for raw_symbol in symbols:
+            symbol = str(raw_symbol).strip()
+            if not symbol:
+                continue
+            if symbol not in unique_symbols:
+                unique_symbols.append(symbol)
+
+        for symbol in unique_symbols:
             for channel in payload_channels:
                 candidates: list[Tuple[str, str, Optional[bool]]]
                 if after_hours is None:
@@ -247,32 +308,168 @@ class FubonGateway(BaseGateway):
                 for key in candidates:
                     if key not in self._active_subscriptions:
                         continue
-                    message = {"channel": channel, "symbol": symbol}
                     stored_after_hours = key[2]
+                    subscription_id = self._subscription_ids_by_key.get(key)
+                    payload_options: list[Mapping[str, Any]] = []
+                    if subscription_id:
+                        payload_options.append({"ids": [subscription_id]})
+                        payload_options.append({"id": subscription_id})
+                    message = {"channel": channel, "symbol": symbol}
                     if stored_after_hours is not None:
                         message["afterHours"] = bool(stored_after_hours)
-                    try:
-                        self._ws_client.unsubscribe(message)
+                    payload_options.append(message)
+
+                    success = False
+                    used_payload: Optional[Mapping[str, Any]] = None
+                    last_exception: Optional[Exception] = None
+                    for payload in payload_options:
+                        try:
+                            self._ws_client.unsubscribe(payload)
+                            success = True
+                            used_payload = payload
+                            break
+                        except TypeError as exc:
+                            last_exception = exc
+                            continue
+                        except Exception as exc:  # pragma: no cover - vendor behaviour
+                            last_exception = exc
+                            self.logger.warning(
+                                "Unsubscribe failed: %s",
+                                exc,
+                                extra={
+                                    "channel": channel,
+                                    "symbol": symbol,
+                                    "gateway_state": "unsubscribe_failed",
+                                },
+                            )
+                            break
+
+                    if success and used_payload is not None:
+                        log_payload = dict(used_payload)
+                        log_payload.setdefault("channel", channel)
+                        log_payload.setdefault("symbol", symbol)
                         self.logger.debug(
                             "Unsubscribed websocket channel %s",
-                            message,
+                            log_payload,
                             extra={
                                 "channel": channel,
                                 "symbol": symbol,
                                 "gateway_state": "unsubscribed",
                             },
                         )
-                    except Exception as exc:  # pragma: no cover - vendor behaviour
-                        self.logger.warning(
-                            "Unsubscribe failed: %s",
-                            exc,
-                            extra={
-                                "channel": channel,
-                                "symbol": symbol,
-                                "gateway_state": "unsubscribe_failed",
-                            },
+                    elif last_exception is not None:
+                        self.logger.debug(
+                            "All unsubscribe payload variants failed for channel=%s symbol=%s: %s",
+                            channel,
+                            symbol,
+                            last_exception,
+                            exc_info=isinstance(last_exception, TypeError),
                         )
-                    self._active_subscriptions.discard(key)
+
+                    self._forget_subscription(key)
+
+    def _register_subscriptions(
+        self,
+        channel: str,
+        symbol_id_map: Mapping[str, Optional[str]],
+        after_hours: Optional[bool],
+    ) -> None:
+        for raw_symbol, subscription_id in symbol_id_map.items():
+            symbol = str(raw_symbol).strip()
+            if not symbol:
+                continue
+            key = (channel, symbol, after_hours)
+            existing_id = self._subscription_ids_by_key.get(key)
+            if key not in self._active_subscriptions:
+                self._active_subscriptions.add(key)
+            if subscription_id:
+                sub_id = str(subscription_id).strip()
+                if sub_id:
+                    self._subscription_ids_by_key[key] = sub_id
+                    self._subscription_key_by_id[sub_id] = key
+            elif existing_id:
+                self._subscription_ids_by_key[key] = existing_id
+
+            log_payload: Dict[str, Any] = {"channel": channel, "symbol": symbol}
+            if after_hours is not None:
+                log_payload["afterHours"] = bool(after_hours)
+            if subscription_id:
+                log_payload["id"] = subscription_id
+
+            self.logger.debug(
+                "Subscribed websocket channel %s",
+                log_payload,
+                extra={
+                    "channel": channel,
+                    "symbol": symbol,
+                    "gateway_state": "subscribed",
+                },
+            )
+
+    def _forget_subscription(self, key: Tuple[str, str, Optional[bool]]) -> None:
+        subscription_id = self._subscription_ids_by_key.pop(key, None)
+        if subscription_id:
+            self._subscription_key_by_id.pop(subscription_id, None)
+        self._active_subscriptions.discard(key)
+
+    def _parse_subscription_ids(self, response: Any, symbols: Sequence[str]) -> Dict[str, str]:
+        parsed: Dict[str, str] = {}
+        target_symbols = {str(symbol).strip() for symbol in symbols if str(symbol).strip()}
+
+        def _record(symbol: Any, value: Any) -> None:
+            if symbol is None or value in (None, "", "null"):
+                return
+            symbol_str = str(symbol).strip()
+            if symbol_str and symbol_str in target_symbols:
+                parsed[symbol_str] = str(value).strip()
+
+        def _walk(payload: Any) -> None:
+            if payload is None:
+                return
+
+            if isinstance(payload, Mapping):
+                ids_value = payload.get("ids")
+                if isinstance(ids_value, (list, tuple)):
+                    for symbol, sub_id in zip(symbols, ids_value):
+                        _record(symbol, sub_id)
+
+                id_value = (
+                    payload.get("id")
+                    or payload.get("subscriptionId")
+                    or payload.get("subscription_id")
+                    or payload.get("channelId")
+                    or payload.get("channel_id")
+                )
+                symbol_value = (
+                    payload.get("symbol")
+                    or payload.get("code")
+                    or payload.get("target")
+                    or payload.get("symbolId")
+                )
+                if symbol_value is not None:
+                    _record(symbol_value, id_value)
+                elif id_value is not None and len(target_symbols) == 1:
+                    _record(next(iter(target_symbols)), id_value)
+
+                for key in ("data", "result", "results", "responses", "subscriptions"):
+                    if key in payload:
+                        _walk(payload[key])
+
+                attr_data = getattr(payload, "data", None)
+                if attr_data is not None and attr_data is not payload:
+                    _walk(attr_data)
+                return
+
+            attr_data = getattr(payload, "data", None)
+            if attr_data is not None and attr_data is not payload:
+                _walk(attr_data)
+
+            if isinstance(payload, (list, tuple, set)):
+                for item in payload:
+                    _walk(item)
+
+        _walk(response)
+        return parsed
 
     def query_account(self) -> Optional[AccountData]:
         if not self.account_api:
@@ -964,6 +1161,9 @@ class FubonGateway(BaseGateway):
             self.logger.debug("Primary account detected: %s", self.primary_account_id)
         if self.account_map:
             self.logger.debug("Available accounts: %s", ", ".join(sorted(self.account_map.keys())))
+
+        if self.order_api:
+            self.order_api.set_account_lookup(self.account_map)
 
     def _extract_account_metadata(self, account: Any) -> dict[str, Any]:
         metadata: dict[str, Any] = {}
