@@ -1,12 +1,5 @@
 {
-    "files.associations": {
-        "random": "cpp",
-        "locale": "cpp",
-        "thread": "cpp",
-        "xlocale": "cpp",
-        "xlocmes": "cpp",
-        "xlocmon": "cpp",
-        "xlocnum": "cpp",
-        "xloctime": "cpp"
-    }
+    "python-envs.defaultEnvManager": "ms-python.python:venv",
+    "python-envs.defaultPackageManager": "ms-python.python:pip",
+    "python-envs.pythonProjects": []
 }

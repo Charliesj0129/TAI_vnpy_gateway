@@ -1,0 +1,23 @@
+{
+  "data": [
+    {
+      "symbol": "TXF",
+      "type": "FUTURE",
+      "contractSize": 200,
+      "name": "TXF Futures",
+      "tickSize": 0.5,
+      "exchange": "TAIFEX",
+      "session": "REGULAR"
+    },
+    {
+      "symbol": "TXO",
+      "type": "OPTION",
+      "contractSize": 50,
+      "name": "TXO Options",
+      "tickSize": 0.1,
+      "exchange": "TAIFEX",
+      "underlyingSymbol": "TXF",
+      "session": "REGULAR"
+    }
+  ]
+}

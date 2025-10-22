@@ -1,0 +1,71 @@
+# Symbol resolution rules consumed by extras/tools/fubon_subscribe.py
+# All timestamps assumed in Asia/Taipei. Calendar metadata drives futures roll logic.
+
+[calendar]
+timezone = "Asia/Taipei"
+trading_days_ahead = 15
+cutoff_time = "16:00"
+
+[futures.TXF]
+exchange = "TAIFEX"
+base_symbol = "TXF"
+front = { month_offset = 0 }
+next = { month_offset = 1 }
+roll_rule = { method = "third_wednesday", switch_time = "00:00" }
+contracts_forward = 3
+
+# For 2025-10-20 the roll rule places the front month on November 2025 (TXFK5)
+# and the next month on December 2025 (TXFL5). Literal aliases below allow
+# operators to subscribe using the exact contract codes published by TAIFEX.
+[futures.TXF.literal]
+front = "TXFK5"
+next = "TXFL5"
+
+[options.TXO]
+exchange = "TAIFEX"
+base_symbol = "TXO"
+weekly_all = { alias = "TXO.weekly_all", include_weeks = ["NEXT"], strikes_window = 30 }
+monthly_near = { alias = "TXO.monthly_near", month_offset = 0, strikes_window = 5 }
+strike_spacing = 50
+strike_center = 27000
+max_weekly_contracts = 100
+max_monthly_contracts = 100
+call_code = "C"
+put_code = "P"
+
+[[options.TXO.weekly_templates]]
+week = "W1"
+listing_rule = "monday_minus_3d"
+expiry_time = "13:45"
+
+[[options.TXO.weekly_templates]]
+week = "W2"
+listing_rule = "week_after_previous"
+expiry_time = "13:45"
+
+[[options.TXO.weekly_templates]]
+week = "W3"
+listing_rule = "week_after_previous"
+expiry_time = "13:45"
+
+[[options.TXO.weekly_templates]]
+week = "W4"
+listing_rule = "week_after_previous"
+expiry_time = "13:45"
+
+[[options.TXO.weekly_templates]]
+week = "W5"
+listing_rule = "week_after_previous"
+expiry_time = "13:45"
+
+[symbol_sets]
+# Default ingestion prioritises literal front/back contracts plus weekly options.
+default = ["TXFK5", "TXFL5", "TXO.weekly_all"]
+
+[[symbol_sets.custom]]
+name = "rolling_aliases"
+members = ["TXF.front", "TXF.next", "TXO.weekly_all"]
+
+[[symbol_sets.custom]]
+name = "options_focus"
+members = ["TXO.weekly_all", "TXO.monthly_near"]

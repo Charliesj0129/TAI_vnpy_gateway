@@ -1,0 +1,60 @@
+# Live test definitions for the Fubon SDK (fubon_neo.sdk).
+
+[meta]
+version = "2025-10-13"
+description = "Auth, account, order, and market coverage aligned with API文檔.md."
+
+[auth]
+
+[[auth.positive]]
+name = "auth.login.success"
+method_candidates = ["login"]
+payload_args = ["$user_id", "$user_password", "$ca_path", "$ca_password"]
+success_keys = ["is_success"]
+
+[[auth.negative]]
+name = "auth.login.invalid_credential"
+method_candidates = ["login"]
+payload_args = ["INVALID", "INVALID", "invalid.pfx", "INVALID"]
+expected_error_substrings = ["invalid", "password", "cert"]
+
+[account]
+
+[[account.positive]]
+name = "account.margin_equity.success"
+method_candidates = ["futopt_accounting.query_margin_equity"]
+payload_args = ["$primary_account"]
+success_keys = ["is_success"]
+
+[[account.positive]]
+name = "account.positions.success"
+method_candidates = ["futopt_accounting.query_hybrid_position"]
+payload_args = ["$primary_account"]
+success_keys = ["is_success"]
+
+[order]
+
+[[order.positive]]
+name = "order.history.success"
+method_candidates = ["futopt.order_history"]
+payload_args = ["$primary_account", "$order_history_start", "$order_history_end"]
+success_keys = ["is_success"]
+
+[[order.positive]]
+name = "order.results.success"
+method_candidates = ["futopt.get_order_results"]
+payload_args = ["$primary_account"]
+success_keys = ["is_success"]
+
+[market]
+
+[[market.positive]]
+name = "market.init_realtime.success"
+method_candidates = ["init_realtime"]
+
+[auth_cleanup]
+
+[[auth_cleanup.positive]]
+name = "auth.logout.success"
+category = "auth"
+method_candidates = ["logout"]

@@ -1,0 +1,24 @@
+[2025-10-20 16:20:50.328046700 +08:00 INFO] [login] personal_id="M220596582"
+[2025-10-20 16:20:50.390921400 +08:00 INFO] this account require 2fa
+[2025-10-20 16:20:50.452854400 +08:00 INFO] [future_option_mapping]: 31.5172ms
+[2025-10-20 16:20:50.467102800 +08:00 INFO] [future_option_mapping]: 12.8883ms
+[2025-10-20 16:20:50.519556 +08:00 INFO] [future_option_mapping]: 52.2416ms
+[2025-10-20 16:20:50.542490100 +08:00 INFO] [future_option_mapping]: 16.9888ms
+[2025-10-20 16:33:30.801096800 +08:00 INFO] [login] personal_id="M220596582"
+[2025-10-20 16:33:30.827276900 +08:00 INFO] this account require 2fa
+[2025-10-20 16:33:30.874011600 +08:00 INFO] [future_option_mapping]: 31.5168ms
+[2025-10-20 16:33:30.887634200 +08:00 INFO] [future_option_mapping]: 12.2662ms
+[2025-10-20 16:33:30.957150700 +08:00 INFO] [future_option_mapping]: 69.2891ms
+[2025-10-20 16:33:30.980263700 +08:00 INFO] [future_option_mapping]: 17.8775ms
+[2025-10-20 16:41:00.576628400 +08:00 INFO] [login] personal_id="M220596582"
+[2025-10-20 16:41:00.662478900 +08:00 INFO] this account require 2fa
+[2025-10-20 16:41:00.786333600 +08:00 INFO] [future_option_mapping]: 94.0523ms
+[2025-10-20 16:41:00.954321800 +08:00 INFO] [future_option_mapping]: 166.559ms
+[2025-10-20 16:41:01.146287400 +08:00 INFO] [future_option_mapping]: 191.77ms
+[2025-10-20 16:41:01.184943200 +08:00 INFO] [future_option_mapping]: 33.1328ms
+[2025-10-20 16:43:27.037148500 +08:00 INFO] [login] personal_id="M220596582"
+[2025-10-20 16:43:27.095351500 +08:00 INFO] this account require 2fa
+[2025-10-20 16:43:27.374156500 +08:00 INFO] [future_option_mapping]: 232.0568ms
+[2025-10-20 16:43:27.417536500 +08:00 INFO] [future_option_mapping]: 41.7948ms
+[2025-10-20 16:43:27.560737600 +08:00 INFO] [future_option_mapping]: 142.9083ms
+[2025-10-20 16:43:27.600980200 +08:00 INFO] [future_option_mapping]: 34.6088ms

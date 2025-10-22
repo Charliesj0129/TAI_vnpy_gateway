@@ -1,0 +1,21 @@
+extends:
+  - spectral:recommended
+formats:
+  - oas3
+rules:
+  path-kebab-case:
+    description: "Paths must use kebab-case."
+    severity: error
+    given: "$.paths[*]~"
+    then:
+      function: pattern
+      functionOptions:
+        match: "^(/[a-z0-9]+(-[a-z0-9]+)*)+$"
+  operation-id-snake:
+    description: "operationId values should use snake_case."
+    severity: error
+    given: "$.paths.*.*.operationId"
+    then:
+      function: pattern
+      functionOptions:
+        match: "^[a-z][a-z0-9_]*$"

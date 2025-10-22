@@ -1,0 +1,38 @@
+# 富邦行情落地管線參數設定
+# -------------------------------------------------------------
+# 預設配置可滿足單機驗證；正式環境請視硬體與頻寬調整。
+
+[postgresql]
+dsn_env = "PG_DSN"                # 從 .env 讀取連線字串
+schema = "public"
+batch_size = 1000                 # 單批寫入筆數上限
+max_workers = 4                   # 寫入執行緒數
+copy_enabled = true               # 優先使用 COPY；失敗 fallback executemany
+copy_timeout_ms = 3000
+
+[ingest]
+channels = ["trades", "orderbook", "quotes"]
+l2_depth = 5
+heartbeat_sec = 15
+raw_backpressure_ms = 750         # 若延遲超過此數值，先落 raw 後再展開
+latency_warn_ms = 350
+
+[retry]
+max_attempts = 5
+backoff_initial_ms = 500
+backoff_multiplier = 2.0
+backoff_cap_ms = 15000
+
+[replay]
+chunk_seconds = 60                # tools/replay_ws_raw.py 單次重播的時間窗口
+max_parallel = 2
+
+[monitor]
+ntp_server = "pool.ntp.org"
+drift_tolerance_ms = 100
+
+[logging]
+level = "INFO"
+json = false
+log_path = "logs/fubon_ingest.log"
+

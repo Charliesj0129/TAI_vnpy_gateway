@@ -1,0 +1,3 @@
+{"data": {"symbol": "TXFQ4", "exchange": "TAIFEX", "name": "TXF", "price": 20500, "volume": 12, "timestamp": "2024-10-15 08:45:00"}}
+{"data": [{"symbol": "TXFQ4", "exchange": "TAIFEX", "price": 20505, "volume": 8}, {"symbol": "TXO13800L5", "exchange": "TAIFEX", "price": 121.5, "volume": 2}]}
+{"channel": "books", "data": {"symbol": "TXFQ4", "exchange": "TAIFEX", "bids": [{"price": 20500, "size": 3}], "asks": [{"price": 20510, "size": 1}]}}

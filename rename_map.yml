@@ -1,0 +1,29 @@
+renames:
+  - source: clients/fubon_api_client.py:55
+    old: FubonCredentials
+    new: StreamingCredentials
+    rationale: Differentiate streaming credential bundle from gateway credentials.
+  - source: clients/fubon_api_client.py:185
+    old: FubonAPIClient
+    new: StreamingDataClient
+    rationale: Clarify role as streaming/WebSocket client.
+  - source: vnpy_fubon/fubon_connect.py:184
+    old: FubonAPIConnector
+    new: SdkSessionConnector
+    rationale: Emphasise SDK session authentication responsibility.
+  - source: adapters/fubon_to_vnpy.py:212
+    old: FubonToVnpyAdapter
+    new: MarketEnvelopeNormalizer
+    rationale: Intent-based name for market payload normalisation.
+  - source: vnpy_fubon/account.py:38
+    old: _normalise_exchange
+    new: _normalize_exchange
+    rationale: Align spelling with public helper `normalize_exchange`.
+  - source: vnpy_fubon/market.py:63
+    old: _normalise_exchange
+    new: _normalize_exchange
+    rationale: Align spelling across modules.
+  - source: vnpy_fubon/order.py:57
+    old: _normalise_exchange
+    new: _normalize_exchange
+    rationale: Align spelling across modules.

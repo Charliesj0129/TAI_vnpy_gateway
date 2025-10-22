@@ -1,0 +1,83 @@
+name: naming
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+jobs:
+  lint-and-naming:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install .[dev]
+      - name: Ruff / Black / isort
+        run: |
+          ruff check .
+          black --check .
+          isort --check-only .
+      - name: Naming consistency score
+        run: |
+          python - <<'PY'
+          import ast
+          import re
+          from pathlib import Path
+
+          ROOT = Path(__file__).resolve().parents[2]
+          INCLUDE = {"main.py", "adapters", "clients", "vnpy_fubon"}
+          EXCLUDE_DIRS = {".git", ".github", ".venv", "__pycache__", ".pytest_cache", "extras"}
+
+          snake = re.compile(r"^_?[a-z][a-z0-9_]*$")
+          pascal = re.compile(r"^[A-Z][A-Za-z0-9]+$")
+
+          total = 0
+          style = 0
+          conflicts = 0
+          drift = 0
+          names = {}
+
+          def should_skip(path: Path) -> bool:
+              return any(part in EXCLUDE_DIRS for part in path.parts)
+
+          def record(name, relpath, lineno):
+              normalized = re.sub(r"[_\\s]", "", name).lower()
+              names.setdefault(normalized, []).append((name, relpath.as_posix(), lineno))
+
+          for path in ROOT.rglob("*.py"):
+              if should_skip(path):
+                  continue
+              rel = path.relative_to(ROOT)
+              if rel.parts[0] not in INCLUDE and rel.as_posix() not in INCLUDE:
+                  continue
+              node = ast.parse(path.read_text(encoding="utf-8"))
+              for item in ast.walk(node):
+                  if isinstance(item, ast.ClassDef):
+                      total += 1
+                      if not pascal.match(item.name):
+                          style += 1
+                      record(item.name, rel, item.lineno)
+                  elif isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                      if item.name.startswith("__"):
+                          continue
+                      total += 1
+                      if not snake.match(item.name):
+                          style += 1
+                      record(item.name, rel, item.lineno)
+
+          for bucket in names.values():
+              if len(bucket) > 1:
+                  conflicts += 1
+                  drift += 1
+
+          score = 1 - (style + conflicts + drift) / max(total, 1)
+          print(f"T={total} V={style} C={conflicts} D={drift} S={score:.4f}")
+          if score < 0.98:
+              raise SystemExit(f"Naming consistency score {score:.4f} < 0.98")
+          PY

@@ -1,0 +1,24 @@
+{
+  "data": [
+    {
+      "symbol": "TXFQ4",
+      "type": "FUTURE",
+      "name": "TXF 2024-11",
+      "settlementDate": "2024-11-20",
+      "startDate": "2024-08-20",
+      "session": "REGULAR",
+      "exchange": "TAIFEX",
+      "contractType": "E"
+    },
+    {
+      "symbol": "TXO13800L5",
+      "type": "OPTION",
+      "name": "TXO 13800 Call",
+      "settlementDate": "2024-11-20",
+      "startDate": "2024-06-20",
+      "session": "REGULAR",
+      "exchange": "TAIFEX",
+      "contractType": "E"
+    }
+  ]
+}

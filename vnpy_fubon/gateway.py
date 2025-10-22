@@ -1,0 +1,1346 @@
+"""
+Gateway implementation that aligns with vn.py's BaseGateway interface and
+manages account, order, and market data flows for the Fubon Securities SDK.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import threading
+from datetime import datetime, timezone
+from threading import Timer
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Set, Tuple
+
+from .account import AccountAPI
+from .fubon_connect import FubonAPIConnector, create_authenticated_client
+from .logging_config import configure_logging
+from .market import MarketAPI
+from .order import OrderAPI
+from .normalization import normalize_exchange, normalize_product, normalize_symbol
+from .vnpy_compat import (
+    AccountData,
+    BaseGateway,
+    Event,
+    EVENT_CONTRACT,
+    EVENT_ACCOUNT,
+    EVENT_LOG,
+    EVENT_FUBON_MARKET_RAW,
+    EVENT_ORDER,
+    EVENT_POSITION,
+    EVENT_TICK,
+    EVENT_TRADE,
+    LogData,
+    BarData,
+    ContractData,
+    OrderData,
+    OrderRequest,
+    PositionData,
+    Exchange,
+    Product,
+    SubscribeRequest,
+    TickData,
+    TradeData,
+    OptionType,
+    HistoryRequest,
+    Interval,
+)
+
+
+class FubonGateway(BaseGateway):
+    """
+    vn.py-compatible gateway for the Fubon Securities SDK.
+    """
+
+    default_name = "FUBON"
+
+    def __init__(
+        self,
+        event_engine: Any,
+        *,
+        connector: Optional[FubonAPIConnector] = None,
+        client: Any = None,
+        log_level: int = logging.INFO,
+        gateway_name: str = "Fubon",
+    ) -> None:
+        super().__init__(event_engine, gateway_name)
+        self.logger = configure_logging(
+            log_level=log_level,
+            logger_name="vnpy_fubon.gateway",
+            gateway_name=gateway_name,
+        )
+        self.connector = connector
+        self.client = client
+        self.login_response: Any = None
+
+        self.accounts: list[Any] = []
+        self.primary_account: Any = None
+        self.primary_account_id: Optional[str] = None
+        self.account_map: dict[str, Any] = {}
+        self.account_metadata: dict[str, Mapping[str, Any]] = {}
+        self.contracts: Dict[str, ContractData] = {}
+        self._symbol_aliases: Dict[str, str] = {}
+        self._symbol_exchange_aliases: Dict[Tuple[str, str], str] = {}
+        self._default_exchange_code = os.getenv("FUBON_EXCHANGE", "TAIFEX")
+
+        self.account_api: Optional[AccountAPI] = None
+        self.order_api: Optional[OrderAPI] = None
+        self.market_api: Optional[MarketAPI] = None
+
+        # Websocket state
+        self._ws_lock = threading.RLock()
+        self._ws_client: Any = None
+        self._ws_connected = False
+        self._ws_handlers_registered = False
+        self._ws_registered_events: list[Tuple[str, Callable[..., None]]] = []
+        self._active_subscriptions: Set[Tuple[str, str, Optional[bool]]] = set()
+        self._ws_reconnect_attempts = 0
+        self._ws_reconnect_timer: Optional[Timer] = None
+        self._closing = False
+        self._ws_sdk_callbacks: list[Tuple[str, Callable[..., None]]] = []
+        self._token_timer: Optional[Timer] = None
+        self._token_refresh_interval = 900  # seconds; aligns with 15-minute default heartbeat
+
+    # ----------------------------------------------------------------------
+    # vn.py BaseGateway interface
+
+    def connect(self, setting: Optional[Mapping[str, Any]] = None) -> None:
+        """
+        Establish SDK session and initialise helper APIs.
+        """
+
+        self.write_log("Connecting to Fubon gateway...", state="connecting")
+        if self.client is None:
+            if self.connector is not None:
+                self.client, self.login_response = self.connector.connect()
+            else:
+                config_path: Optional[Path] = None
+                dotenv_path: Optional[Path] = None
+                use_env_only = False
+                if setting:
+                    config_value = setting.get("config_path")
+                    if config_value:
+                        config_path = Path(config_value)
+                    dotenv_value = setting.get("dotenv_path")
+                    if dotenv_value:
+                        dotenv_path = Path(dotenv_value)
+                    use_env_only = bool(setting.get("use_env_only"))
+                self.client, self.login_response = create_authenticated_client(
+                    config_path=None if use_env_only else config_path,
+                    dotenv_path=dotenv_path,
+                    log_level=self.logger.level,
+                )
+        else:
+            self.login_response = getattr(self.client, "login_response", None)
+
+        if self.client is None:
+            raise RuntimeError("Failed to acquire Fubon SDK client.")
+
+        self._populate_account_metadata(setting)
+
+        self.account_api = AccountAPI(self.client, gateway_name=self.gateway_name, logger=self.logger)
+        self.order_api = OrderAPI(
+            self.client,
+            account_id=self.primary_account_id,
+            gateway_name=self.gateway_name,
+            logger=self.logger,
+        )
+        if self.primary_account_id:
+            self.order_api.account_id = self.primary_account_id
+        self.market_api = MarketAPI(self.client, gateway_name=self.gateway_name, logger=self.logger)
+
+        self._register_order_callbacks()
+        self._prepare_realtime()
+        self._ensure_websocket_client(register_handler=True)
+        self._start_token_refresh()
+        self._load_and_publish_contracts()
+
+        self.write_log("Fubon gateway connected.", state="connected")
+
+    def close(self) -> None:
+        """
+        Disconnect websocket client and reset state.
+        """
+
+        self._closing = True
+        self.write_log("Closing Fubon gateway...", state="closing")
+        self._cancel_ws_reconnect()
+        self._disconnect_websocket()
+        self.accounts.clear()
+        self.primary_account = None
+        self.primary_account_id = None
+        self.account_api = None
+        self.order_api = None
+        self.market_api = None
+        self.contracts.clear()
+        self._symbol_aliases.clear()
+        self._symbol_exchange_aliases.clear()
+        self.write_log("Fubon gateway closed.", state="closed")
+        self._closing = False
+
+    def subscribe(self, req: SubscribeRequest, *, channels: Optional[Sequence[str]] = None, after_hours: Optional[bool] = None) -> None:
+        self.subscribe_quotes([req.symbol], channels=channels, after_hours=after_hours)
+
+    def subscribe_quotes(
+        self,
+        symbols: Sequence[str],
+        *,
+        channels: Optional[Sequence[str]] = None,
+        after_hours: Optional[bool] = None,
+    ) -> None:
+        client = self._ensure_websocket_client(register_handler=True)
+        payload_channels = list(channels or ("books",))
+        for symbol in symbols:
+            for channel in payload_channels:
+                key = (channel, symbol, after_hours)
+                if key in self._active_subscriptions:
+                    continue
+                message = {"channel": channel, "symbol": symbol}
+                if after_hours is not None:
+                    message["afterHours"] = bool(after_hours)
+                try:
+                    client.subscribe(message)
+                    self._active_subscriptions.add(key)
+                    self.logger.debug(
+                        "Subscribed websocket channel %s",
+                        message,
+                        extra={
+                            "channel": channel,
+                            "symbol": symbol,
+                            "gateway_state": "subscribed",
+                        },
+                    )
+                except Exception as exc:
+                    self.logger.warning(
+                        "Subscribe failed for %s: %s",
+                        message,
+                        exc,
+                        extra={
+                            "channel": channel,
+                            "symbol": symbol,
+                            "gateway_state": "subscribe_failed",
+                        },
+                    )
+                    if self._should_reconnect_after_error(exc):
+                        self._schedule_ws_reconnect()
+                    else:
+                        self._put_event(EVENT_LOG, f"Subscription rejected for {message}: {exc}")
+                    raise
+
+    def unsubscribe_quotes(
+        self,
+        symbols: Sequence[str],
+        *,
+        channels: Optional[Sequence[str]] = None,
+        after_hours: Optional[bool] = None,
+    ) -> None:
+        if not self._ws_client:
+            return
+        payload_channels = list(channels or ("books",))
+        for symbol in symbols:
+            for channel in payload_channels:
+                candidates: list[Tuple[str, str, Optional[bool]]]
+                if after_hours is None:
+                    candidates = [entry for entry in self._active_subscriptions if entry[0] == channel and entry[1] == symbol]
+                else:
+                    candidates = [(channel, symbol, after_hours)]
+                for key in candidates:
+                    if key not in self._active_subscriptions:
+                        continue
+                    message = {"channel": channel, "symbol": symbol}
+                    stored_after_hours = key[2]
+                    if stored_after_hours is not None:
+                        message["afterHours"] = bool(stored_after_hours)
+                    try:
+                        self._ws_client.unsubscribe(message)
+                        self.logger.debug(
+                            "Unsubscribed websocket channel %s",
+                            message,
+                            extra={
+                                "channel": channel,
+                                "symbol": symbol,
+                                "gateway_state": "unsubscribed",
+                            },
+                        )
+                    except Exception as exc:  # pragma: no cover - vendor behaviour
+                        self.logger.warning(
+                            "Unsubscribe failed: %s",
+                            exc,
+                            extra={
+                                "channel": channel,
+                                "symbol": symbol,
+                                "gateway_state": "unsubscribe_failed",
+                            },
+                        )
+                    self._active_subscriptions.discard(key)
+
+    def query_account(self) -> Optional[AccountData]:
+        if not self.account_api:
+            return None
+        account = self.account_api.query_account()
+        self._put_event(EVENT_ACCOUNT, account)
+        self._put_event(EVENT_LOG, f"Account {account.accountid} queried.")
+        return account
+
+    def query_positions(self) -> Sequence[PositionData]:
+        if not self.account_api:
+            return []
+        positions = self.account_api.query_positions()
+        for position in positions:
+            self._put_event(EVENT_POSITION, position)
+        return positions
+
+    def place_order(self, request: OrderRequest | Mapping[str, Any]) -> OrderData:
+        if not self.order_api:
+            raise RuntimeError("Gateway not connected.")
+        order = self.order_api.place_order(request)
+        self._put_event(EVENT_ORDER, order)
+        return order
+
+    def cancel_order(self, order_id: str) -> bool:
+        if not self.order_api:
+            raise RuntimeError("Gateway not connected.")
+        result = self.order_api.cancel_order(order_id)
+        if result:
+            self.write_log(f"Cancel request for order {order_id} submitted.")
+        return result
+
+    def query_trades(self) -> Sequence[TradeData]:
+        if not self.order_api:
+            return []
+        trades = self.order_api.query_trades()
+        for trade in trades:
+            self._put_event(EVENT_TRADE, trade)
+        return trades
+
+    def query_contracts(self) -> Sequence[ContractData]:
+        return list(self.contracts.values())
+
+    def get_default_setting(self) -> Mapping[str, Any]:
+        """
+        Provide default connection fields for vn.py UI integration.
+        """
+
+        return {
+            "user_id": os.getenv("FUBON_USER_ID", ""),
+            "password": os.getenv("FUBON_USER_PASSWORD", ""),
+            "ca_path": os.getenv("FUBON_CA_PATH", ""),
+            "ca_password": os.getenv("FUBON_CA_PASSWORD", ""),
+            "account_id": os.getenv("FUBON_PRIMARY_ACCOUNT", ""),
+        }
+
+    def _load_and_publish_contracts(self) -> None:
+        records = self._fetch_contracts_from_rest()
+        if not records:
+            self.logger.warning(
+                "Fubon REST API returned no contracts; GUI features may be limited.",
+                extra={"gateway_state": "contracts_missing"},
+            )
+            return
+
+        self.contracts.clear()
+        self._symbol_aliases.clear()
+        self._symbol_exchange_aliases.clear()
+
+        emitted = 0
+        for contract, raw_symbol, raw_exchange in records:
+            self.contracts[contract.vt_symbol] = contract
+            self._register_contract_aliases(contract, raw_symbol, raw_exchange)
+            self.on_contract(contract)
+            emitted += 1
+
+        self.write_log(
+            f"Loaded {emitted} contracts from Fubon REST API.",
+            state="contracts_loaded",
+        )
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+
+    def _fetch_contracts_from_rest(self) -> List[Tuple[ContractData, str, str]]:
+        intraday = self._get_intraday_client()
+        if intraday is None:
+            self.logger.debug("REST intraday client unavailable; skipping contract download.")
+            return []
+
+        product_metadata = self._fetch_product_metadata(intraday)
+
+        query_params = [
+            {"type": "FUTURE", "session": "REGULAR"},
+            {"type": "FUTURE", "session": "AFTERHOURS"},
+            {"type": "OPTION", "session": "REGULAR"},
+            {"type": "OPTION", "session": "AFTERHOURS"},
+        ]
+
+        contracts: Dict[str, Tuple[ContractData, str, str]] = {}
+        for params in query_params:
+            try:
+                response = intraday.tickers(
+                    exchange=self._default_exchange_code, limit=2000, **params
+                )
+            except Exception as exc:  # pragma: no cover - vendor behaviour
+                self.logger.debug("intraday.tickers failed for %s: %s", params, exc)
+                continue
+
+            for item in response.get("data") or []:
+                mapped = self._map_ticker_to_contract(item, product_metadata)
+                if not mapped:
+                    continue
+                contract, raw_symbol, raw_exchange = mapped
+                contracts[contract.vt_symbol] = (contract, raw_symbol, raw_exchange)
+
+        return list(contracts.values())
+
+    def _get_intraday_client(self) -> Any:
+        if self.client is None:
+            return None
+
+        marketdata = getattr(self.client, "marketdata", None)
+        if marketdata is None:
+            self._prepare_realtime()
+            marketdata = getattr(self.client, "marketdata", None)
+            if marketdata is None:
+                return None
+
+        rest_client = getattr(marketdata, "rest_client", None)
+        if rest_client is None:
+            return None
+
+        futopt_rest = getattr(rest_client, "futopt", None)
+        if futopt_rest is None:
+            return None
+
+        return getattr(futopt_rest, "intraday", None)
+
+    def _fetch_product_metadata(self, intraday: Any) -> Dict[str, Mapping[str, Any]]:
+        product_metadata: Dict[str, Mapping[str, Any]] = {}
+        product_params = [
+            {"type": "FUTURE", "session": "REGULAR"},
+            {"type": "FUTURE", "session": "AFTERHOURS"},
+            {"type": "OPTION", "session": "REGULAR"},
+            {"type": "OPTION", "session": "AFTERHOURS"},
+        ]
+
+        for params in product_params:
+            try:
+                response = intraday.products(
+                    exchange=self._default_exchange_code, limit=2000, **params
+                )
+            except Exception as exc:  # pragma: no cover - vendor behaviour
+                self.logger.debug("intraday.products failed for %s: %s", params, exc)
+                continue
+
+            for item in response.get("data") or []:
+                symbol = str(item.get("symbol") or "").strip().upper()
+                if not symbol:
+                    continue
+                existing = product_metadata.get(symbol, {})
+                merged = {**existing, **item}
+                product_metadata[symbol] = merged
+
+        return product_metadata
+
+    def _map_ticker_to_contract(
+        self,
+        ticker: Mapping[str, Any],
+        product_metadata: Mapping[str, Mapping[str, Any]],
+    ) -> Optional[Tuple[ContractData, str, str]]:
+        raw_symbol = str(ticker.get("symbol") or "").strip()
+        symbol = normalize_symbol(raw_symbol)
+        if not symbol:
+            return None
+
+        product_descriptor = ticker.get("type") or ""
+        product_key = self._match_product_symbol(symbol, product_metadata)
+        metadata = product_metadata.get(product_key or "", {})
+        product = normalize_product(product_descriptor, default=Product.FUTURES)
+
+        name = ticker.get("name") or metadata.get("name") or symbol
+
+        def _to_float(value: Any, default: float) -> float:
+            if value is None:
+                return default
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return default
+
+        size = _to_float(
+            metadata.get("contractSize")
+            or metadata.get("contractMultiplier")
+            or metadata.get("multiplier")
+            or 1,
+            1.0,
+        )
+        pricetick = _to_float(metadata.get("tickSize") or ticker.get("tickSize") or 1, 1.0)
+
+        exchange_code = (
+            ticker.get("exchange")
+            or metadata.get("exchange")
+            or self._default_exchange_code
+        )
+        exchange = normalize_exchange(exchange_code, default=self._default_exchange_code)
+
+        contract = ContractData(
+            gateway_name=self.gateway_name,
+            symbol=symbol,
+            exchange=exchange,
+            name=str(name),
+            product=product,
+            size=size,
+            pricetick=pricetick,
+        )
+        contract.min_volume = max(1.0, _to_float(metadata.get("minVolume") or metadata.get("minimumVolume"), 1.0))
+        contract.history_data = True
+
+        contract.extra = {
+            "session": ticker.get("session"),
+            "contractType": ticker.get("contractType") or metadata.get("contractType"),
+            "flowGroup": ticker.get("flowGroup"),
+            "rawSymbol": raw_symbol,
+            "rawExchange": exchange_code,
+            "canonicalSymbol": symbol,
+            "canonicalExchange": getattr(exchange, "value", str(exchange)),
+        }
+
+        if product is Product.OPTION:
+            self._populate_option_fields(contract, ticker, metadata)
+
+        return contract, raw_symbol, str(exchange_code or "")
+
+    def _match_product_symbol(
+        self, contract_symbol: str, product_metadata: Mapping[str, Mapping[str, Any]]
+    ) -> Optional[str]:
+        upper_symbol = contract_symbol.upper()
+        best_match: Optional[str] = None
+        best_length = 0
+        for candidate in product_metadata.keys():
+            if upper_symbol.startswith(candidate) and len(candidate) > best_length:
+                best_length = len(candidate)
+                best_match = candidate
+        return best_match
+
+    def _register_contract_aliases(
+        self,
+        contract: ContractData,
+        raw_symbol: str,
+        raw_exchange: str,
+    ) -> None:
+        vt_symbol = contract.vt_symbol
+        canonical_symbol = normalize_symbol(contract.symbol)
+        canonical_exchange = getattr(contract.exchange, "value", str(contract.exchange))
+
+        normalized_raw_symbol = normalize_symbol(raw_symbol) or canonical_symbol
+        raw_exchange_code = normalize_symbol(raw_exchange)
+
+        # Base symbol aliases
+        self._symbol_aliases.setdefault(canonical_symbol, vt_symbol)
+        self._symbol_aliases.setdefault(normalized_raw_symbol, vt_symbol)
+        self._symbol_aliases.setdefault(vt_symbol, vt_symbol)
+
+        # Exchange-aware aliases
+        self._symbol_exchange_aliases.setdefault(
+            (normalized_raw_symbol, canonical_exchange),
+            vt_symbol,
+        )
+        self._symbol_exchange_aliases.setdefault(
+            (canonical_symbol, canonical_exchange),
+            vt_symbol,
+        )
+        if raw_exchange_code:
+            self._symbol_exchange_aliases.setdefault(
+                (normalized_raw_symbol, raw_exchange_code),
+                vt_symbol,
+            )
+
+    def resolve_vt_symbol(self, symbol: str, exchange: Optional[str] = None) -> Optional[str]:
+        """
+        Resolve a symbol (with optional exchange) into a canonical vt_symbol.
+        """
+
+        if not symbol:
+            return None
+
+        direct_candidate = symbol.upper()
+        if direct_candidate in self.contracts:
+            return direct_candidate
+
+        normalized_symbol = normalize_symbol(symbol)
+        if not normalized_symbol:
+            return None
+
+        if exchange:
+            normalized_exchange = normalize_symbol(exchange)
+            vt_symbol = self._symbol_exchange_aliases.get((normalized_symbol, normalized_exchange))
+            if vt_symbol:
+                return vt_symbol
+
+            exchange_enum = normalize_exchange(exchange)
+            canonical_exchange = getattr(exchange_enum, "value", str(exchange_enum))
+            vt_symbol = self._symbol_exchange_aliases.get((normalized_symbol, canonical_exchange))
+            if vt_symbol:
+                return vt_symbol
+
+        vt_symbol = self._symbol_aliases.get(normalized_symbol)
+        if vt_symbol:
+            return vt_symbol
+
+        return None
+
+    def find_contract(self, symbol: str, exchange: Optional[str] = None) -> Optional[ContractData]:
+        """
+        Retrieve a contract using raw symbol/exchange identifiers.
+        """
+
+        vt_symbol = self.resolve_vt_symbol(symbol, exchange)
+        if not vt_symbol:
+            return None
+        return self.contracts.get(vt_symbol)
+
+    def _populate_option_fields(
+        self,
+        contract: ContractData,
+        ticker: Mapping[str, Any],
+        metadata: Mapping[str, Any],
+    ) -> None:
+        strike = self._parse_option_strike(contract.symbol, metadata.get("symbol"))
+        if strike is not None:
+            contract.option_strike = strike
+
+        underlying = metadata.get("underlyingSymbol")
+        if underlying:
+            exchange_value = getattr(contract.exchange, "value", str(contract.exchange))
+            contract.option_underlying = f"{underlying}.{exchange_value}"
+
+        expiry_date = ticker.get("settlementDate") or ticker.get("endDate")
+        contract.option_expiry = self._parse_date(expiry_date)
+        contract.option_listed = self._parse_date(ticker.get("startDate"))
+
+        option_type = self._resolve_option_type(contract.symbol)
+        if option_type:
+            contract.option_type = option_type
+
+    def _parse_option_strike(self, symbol: str, product_symbol: Any) -> Optional[float]:
+        if not symbol:
+            return None
+        base = str(product_symbol or "").upper()
+        prefix_len = len(base)
+        if prefix_len and symbol.upper().startswith(base):
+            suffix = symbol[prefix_len:]
+        else:
+            suffix = symbol
+        numeric = "".join(ch for ch in suffix[:-2] if ch.isdigit())
+        if not numeric:
+            return None
+        try:
+            return float(numeric)
+        except ValueError:
+            return None
+
+    def _resolve_option_type(self, symbol: str) -> Optional[OptionType]:
+        if len(symbol) < 2:
+            return None
+        month_code = symbol[-2].upper()
+        if month_code in "ABCDEFGHIJKL":
+            return OptionType.CALL
+        if month_code in "MNOPQRSTUVWX":
+            return OptionType.PUT
+        return None
+
+    def _parse_date(self, value: Any) -> Optional[datetime]:
+        if not value:
+            return None
+        text = str(value).strip()
+        if not text:
+            return None
+        for fmt in ("%Y-%m-%d", "%Y/%m/%d"):
+            try:
+                return datetime.strptime(text, fmt)
+            except ValueError:
+                continue
+        try:
+            return datetime.fromisoformat(text)
+        except ValueError:
+            return None
+
+    def _prepare_realtime(self) -> None:
+        if self.client is None:
+            return
+        token_method = getattr(self.client, "exchange_realtime_token", None)
+        if callable(token_method):
+            try:
+                token_method()
+            except Exception as exc:
+                self.logger.debug("exchange_realtime_token() failed: %s", exc)
+
+        init_method = getattr(self.client, "init_realtime", None)
+        if callable(init_method):
+            try:
+                init_method()
+            except TypeError:
+                try:
+                    init_method(mode=None)
+                except Exception as exc:
+                    self.logger.debug("init_realtime(mode=None) failed: %s", exc)
+            except Exception as exc:
+                self.logger.debug("init_realtime() failed: %s", exc)
+
+    def _ensure_websocket_client(self, *, register_handler: bool = False) -> Any:
+        if self.client is None:
+            raise RuntimeError("Gateway client unavailable.")
+
+        with self._ws_lock:
+            if self._ws_client is None:
+                marketdata = getattr(self.client, "marketdata", None)
+                if marketdata is None:
+                    self._prepare_realtime()
+                    marketdata = getattr(self.client, "marketdata", None)
+                    if marketdata is None:
+                        raise RuntimeError("marketdata client not exposed by SDK.")
+                factory = getattr(marketdata, "websocket_client", None)
+                if factory is None:
+                    raise RuntimeError("websocket_client factory missing in marketdata.")
+                futopt_client = getattr(factory, "futopt", None)
+                if futopt_client is None:
+                    raise RuntimeError("FutOpt websocket client unavailable in this SDK build.")
+                self._ws_client = futopt_client
+
+            if not self._ws_connected:
+                try:
+                    self._ws_client.connect()
+                    self._ws_connected = True
+                    self._ws_reconnect_attempts = 0
+                    self._cancel_ws_reconnect()
+                    self.logger.info(
+                        "FutOpt websocket connected.",
+                        extra={"gateway_state": "ws_connected"},
+                    )
+                except Exception as exc:
+                    self.logger.warning(
+                        "Websocket connection failed: %s",
+                        exc,
+                        extra={"gateway_state": "ws_error"},
+                    )
+                    self._schedule_ws_reconnect()
+                    raise
+                self._resubscribe_all()
+                self._start_token_refresh()
+
+            if register_handler:
+                self._register_ws_handlers()
+
+            return self._ws_client
+
+    def _disconnect_websocket(self) -> None:
+        with self._ws_lock:
+            if self._ws_client is None:
+                return
+
+            self._unregister_ws_handlers()
+
+            if self._ws_connected:
+                disconnect = getattr(self._ws_client, "disconnect", None)
+                if callable(disconnect):
+                    try:
+                        disconnect()
+                    except Exception:
+                        pass
+                self._ws_connected = False
+
+            self._ws_client = None
+            self._active_subscriptions.clear()
+            self._cancel_ws_reconnect()
+
+    def _resubscribe_all(self) -> None:
+        if not self._ws_client or not self._active_subscriptions:
+            return
+        for channel, symbol, after_hours in list(self._active_subscriptions):
+            payload = {"channel": channel, "symbol": symbol}
+            if after_hours is not None:
+                payload["afterHours"] = bool(after_hours)
+            try:
+                self._ws_client.subscribe(payload)
+                self.logger.debug(
+                    "Re-subscribed websocket channel %s",
+                    payload,
+                    extra={
+                        "channel": channel,
+                        "symbol": symbol,
+                        "gateway_state": "resubscribed",
+                    },
+                )
+            except Exception as exc:
+                self.logger.warning(
+                    "Failed to re-subscribe %s: %s",
+                    payload,
+                    exc,
+                    extra={
+                        "channel": channel,
+                        "symbol": symbol,
+                        "gateway_state": "resubscribe_failed",
+                    },
+                )
+
+    def _register_ws_handlers(self) -> None:
+        if self._ws_handlers_registered or not self._ws_client:
+            return
+        registered = False
+        self._ws_registered_events.clear()
+        handler = getattr(self._ws_client, "on", None)
+        if callable(handler):
+            events: list[Tuple[str, Callable[..., None]]] = [
+                ("message", self._handle_ws_message),
+                ("disconnect", self._handle_ws_disconnect),
+                ("error", self._handle_ws_error),
+                ("authenticated", self._handle_ws_authenticated),
+            ]
+            for event_name, callback in events:
+                try:
+                    handler(event_name, callback)
+                    self._ws_registered_events.append((event_name, callback))
+                except Exception as exc:
+                    self.logger.debug("Registering websocket handler %s failed: %s", event_name, exc)
+            if self._ws_registered_events:
+                registered = True
+
+        self._register_sdk_callbacks()
+        if self._ws_sdk_callbacks:
+            registered = True
+
+        self._ws_handlers_registered = registered
+
+    def _register_sdk_callbacks(self) -> None:
+        self._ws_sdk_callbacks.clear()
+        if not self._ws_client:
+            return
+
+        setter_pairs: tuple[tuple[str, Callable[..., None]], ...] = (
+            ("set_on_event", self._handle_ws_sdk_event),
+            ("set_on_error", self._handle_ws_sdk_error),
+        )
+        for method_name, handler in setter_pairs:
+            method = getattr(self._ws_client, method_name, None)
+            if not callable(method):
+                continue
+            try:
+                method(handler)
+                self._ws_sdk_callbacks.append((method_name, handler))
+                self.logger.debug("Registered websocket callback via %s", method_name)
+            except Exception as exc:
+                self.logger.debug("Registering websocket callback %s failed: %s", method_name, exc)
+
+    def _unregister_sdk_callbacks(self) -> None:
+        if not self._ws_client or not self._ws_sdk_callbacks:
+            return
+        for method_name, _handler in self._ws_sdk_callbacks:
+            setter = getattr(self._ws_client, method_name, None)
+            if callable(setter):
+                try:
+                    setter(None)
+                except Exception:
+                    pass
+        self._ws_sdk_callbacks.clear()
+
+    def _unregister_ws_handlers(self) -> None:
+        if not self._ws_client or not self._ws_handlers_registered:
+            return
+        off = getattr(self._ws_client, "off", None)
+        if callable(off):
+            for event_name, callback in self._ws_registered_events:
+                try:
+                    off(event_name, callback)
+                except Exception:
+                    pass
+        self._ws_registered_events.clear()
+        self._unregister_sdk_callbacks()
+        self._ws_handlers_registered = False
+        self._cancel_token_refresh()
+
+    def _start_token_refresh(self) -> None:
+        if self._closing or self.client is None:
+            return
+        interval_env = os.getenv("FUBON_TOKEN_REFRESH_INTERVAL")
+        if interval_env:
+            try:
+                interval = max(60, int(interval_env))
+            except ValueError:
+                self.logger.debug("Invalid FUBON_TOKEN_REFRESH_INTERVAL=%s", interval_env)
+                interval = self._token_refresh_interval
+        else:
+            interval = self._token_refresh_interval
+        timer = Timer(interval, self._refresh_token)
+        timer.daemon = True
+        self._token_timer = timer
+        timer.start()
+
+    def _cancel_token_refresh(self) -> None:
+        if self._token_timer:
+            self._token_timer.cancel()
+            self._token_timer = None
+
+    def _refresh_token(self) -> None:
+        with self._ws_lock:
+            self._token_timer = None
+        if self._closing:
+            return
+        method = getattr(self.client, "exchange_realtime_token", None)
+        if callable(method):
+            try:
+                method()
+                self.logger.debug("exchange_realtime_token() executed for heartbeat.")
+            except Exception as exc:  # pragma: no cover - vendor behaviour
+                message = f"exchange_realtime_token() heartbeat failed: {exc}"
+                self.logger.warning(
+                    message,
+                    extra={"gateway_state": "heartbeat_failed"},
+                )
+                self._put_event(EVENT_LOG, message)
+                self._prepare_realtime()
+                with self._ws_lock:
+                    self._ws_connected = False
+                if self._should_reconnect_after_error(exc):
+                    self._schedule_ws_reconnect()
+        else:
+            self.logger.debug("exchange_realtime_token() not available on client.")
+        self._start_token_refresh()
+
+    def _populate_account_metadata(self, setting: Optional[Mapping[str, Any]] = None) -> None:
+        data = getattr(self.login_response, "data", None)
+        if isinstance(data, (list, tuple)):
+            self.accounts = list(data)
+        else:
+            self.accounts = []
+
+        self.account_map = {}
+        self.account_metadata = {}
+        for account in self.accounts:
+            metadata = self._extract_account_metadata(account)
+            account_id = metadata.get("account_id")
+            if not account_id:
+                continue
+            self.account_map[account_id] = account
+            self.account_metadata[account_id] = metadata
+
+        self.primary_account = None
+        self.primary_account_id = None
+
+        preferred_account = None
+        if setting:
+            preferred_account = (
+                setting.get("account_id")
+                or setting.get("account")
+                or setting.get("primary_account")
+            )
+        if not preferred_account:
+            preferred_account = os.getenv("FUBON_PRIMARY_ACCOUNT")
+
+        if preferred_account:
+            preferred_account = str(preferred_account).strip()
+            account = self.account_map.get(preferred_account)
+            if account:
+                self.primary_account = account
+                self.primary_account_id = preferred_account
+                self.logger.debug("Primary account set via configuration: %s", preferred_account)
+            else:
+                self.logger.warning(
+                    "Requested account %s not found; falling back to default.",
+                    preferred_account,
+                    extra={"gateway_state": "account_warning"},
+                )
+
+        if not self.primary_account and self.accounts:
+            for account in self.accounts:
+                account_id = getattr(account, "account", None)
+                if account_id is not None:
+                    self.primary_account = account
+                    self.primary_account_id = str(account_id)
+                    break
+            if not self.primary_account:
+                self.primary_account = self.accounts[0]
+                account_id = getattr(self.primary_account, "account", None)
+                self.primary_account_id = str(account_id) if account_id is not None else None
+
+        if self.primary_account_id:
+            self.logger.debug("Primary account detected: %s", self.primary_account_id)
+        if self.account_map:
+            self.logger.debug("Available accounts: %s", ", ".join(sorted(self.account_map.keys())))
+
+    def _extract_account_metadata(self, account: Any) -> dict[str, Any]:
+        metadata: dict[str, Any] = {}
+        account_id = self._get_metadata_value(account, ("account", "account_id", "acct", "id"))
+        if account_id is not None:
+            metadata["account_id"] = str(account_id).strip()
+        account_name = self._get_metadata_value(account, ("account_name", "name", "accountName"))
+        if account_name:
+            metadata["account_name"] = str(account_name).strip()
+        account_type = self._get_metadata_value(account, ("account_type", "type", "acctType"))
+        if account_type:
+            metadata["account_type"] = str(account_type).strip()
+        broker_id = self._get_metadata_value(account, ("broker_id", "broker", "brokerId"))
+        if broker_id:
+            metadata["broker_id"] = str(broker_id).strip()
+        market = self._get_metadata_value(account, ("market", "exchange"))
+        if market:
+            metadata["market"] = str(market).strip()
+        default_flag = self._get_metadata_value(account, ("default", "is_default", "primary"))
+        if default_flag is not None:
+            metadata["is_default"] = bool(default_flag)
+        return metadata
+
+    def _get_metadata_value(self, source: Any, candidates: Sequence[str]) -> Any:
+        for key in candidates:
+            if isinstance(source, Mapping) and key in source:
+                value = source[key]
+            else:
+                try:
+                    value = getattr(source, key, None)
+                except Exception:  # pragma: no cover - vendor specific attribute access
+                    value = None
+            if value not in (None, ""):
+                return value
+        return None
+
+    def _resolve_candidate_account_id(self, payload: Any) -> Optional[str]:
+        if isinstance(payload, Mapping):
+            value = self._get_metadata_value(payload, ("account", "account_id", "acct", "id"))
+            if value is not None:
+                return str(value).strip()
+        elif hasattr(payload, "__dict__"):
+            value = self._get_metadata_value(payload, ("account", "account_id", "acct", "id"))
+            if value is not None:
+                return str(value).strip()
+        if isinstance(payload, str):
+            stripped = payload.strip()
+            return stripped or None
+        return None
+
+    def _register_order_callbacks(self) -> None:
+        if self.client is None:
+            return
+
+        callback_pairs = (
+            ("set_on_futopt_order", self._handle_order_event),
+            ("set_on_order_changed", self._handle_order_event),
+            ("set_on_futopt_filled", self._handle_trade_event),
+            ("set_on_filled", self._handle_trade_event),
+        )
+        for method_name, handler in callback_pairs:
+            method = getattr(self.client, method_name, None)
+            if not callable(method):
+                continue
+            try:
+                method(handler)
+                self.logger.debug("Registered callback via %s", method_name)
+            except Exception as exc:
+                self.logger.debug("Registering %s failed: %s", method_name, exc)
+
+    def _handle_ws_message(self, message: str) -> None:
+        if not self.market_api:
+            return
+        events = self.market_api.parse_market_events(message)
+        for event in events:
+            payload = dict(event.payload)
+            if event.channel and "channel" not in payload:
+                payload["channel"] = event.channel
+            payload.setdefault("event_type", event.event_type)
+            self._put_event(EVENT_FUBON_MARKET_RAW, payload)
+            if event.event_type == "orderbook" and event.tick:
+                event.tick.gateway_name = self.gateway_name
+                self._put_event(EVENT_TICK, event.tick)
+
+    def _handle_ws_disconnect(self, *args: Any, **kwargs: Any) -> None:
+        if self._closing:
+            return
+        message = f"FutOpt websocket disconnected: args={args} kwargs={kwargs}"
+        self.logger.warning(
+            message,
+            extra={"gateway_state": "ws_disconnected"},
+        )
+        self._put_event(EVENT_LOG, message)
+        with self._ws_lock:
+            self._ws_connected = False
+        self._schedule_ws_reconnect()
+
+    def _handle_ws_error(self, error: Any) -> None:
+        if self._closing:
+            return
+        message = f"FutOpt websocket error: {error}"
+        self.logger.warning(
+            message,
+            extra={"gateway_state": "ws_error"},
+        )
+        self._put_event(EVENT_LOG, message)
+        with self._ws_lock:
+            self._ws_connected = False
+        if self._should_reconnect_after_error(error):
+            self._schedule_ws_reconnect()
+
+    def _handle_ws_authenticated(self, *_args: Any, **_kwargs: Any) -> None:
+        self.logger.debug(
+            "FutOpt websocket authenticated.",
+            extra={"gateway_state": "ws_authenticated"},
+        )
+        with self._ws_lock:
+            self._ws_connected = True
+        self._cancel_ws_reconnect()
+        self._start_token_refresh()
+
+    def _handle_ws_sdk_event(self, event: Any) -> None:
+        message = f"FutOpt websocket event: {event}"
+        self.logger.info(
+            message,
+            extra={"gateway_state": "ws_event"},
+        )
+        self._put_event(EVENT_LOG, message)
+        if isinstance(event, Mapping):
+            status = str(
+                event.get("status") or event.get("event") or event.get("code") or ""
+            ).lower()
+            if status in {"unauthorized", "unauthenticated", "token_expired"}:
+                with self._ws_lock:
+                    self._ws_connected = False
+                self._schedule_ws_reconnect()
+
+    def _handle_ws_sdk_error(self, error: Any) -> None:
+        message = f"FutOpt websocket SDK error: {error}"
+        self.logger.error(message, extra={"gateway_state": "ws_error"})
+        self._put_event(EVENT_LOG, message)
+        with self._ws_lock:
+            self._ws_connected = False
+        if self._should_reconnect_after_error(error):
+            self._schedule_ws_reconnect()
+
+    def _handle_order_event(self, payload: Any) -> None:
+        if not self.order_api or not isinstance(payload, Mapping):
+            return
+        try:
+            order = self.order_api.to_order_data(payload)
+            self._put_event(EVENT_ORDER, order)
+        except Exception as exc:  # pragma: no cover - vendor payload
+            self.logger.debug("Failed to map order payload %s: %s", payload, exc)
+
+    def _handle_trade_event(self, payload: Any) -> None:
+        if not self.order_api or not isinstance(payload, Mapping):
+            return
+        try:
+            trade = self.order_api.to_trade_data(payload)
+            self._put_event(EVENT_TRADE, trade)
+        except Exception as exc:  # pragma: no cover - vendor payload
+            self.logger.debug("Failed to map trade payload %s: %s", payload, exc)
+
+    def _should_reconnect_after_error(self, error: Any) -> bool:
+        message = str(getattr(error, "message", error)).lower()
+        non_retriable_tokens = (
+            "invalid channel",
+            "invalid symbol",
+            "unknown channel",
+            "unknown symbol",
+            "bad request",
+            "parameter",
+        )
+        return not any(token in message for token in non_retriable_tokens)
+
+    def _schedule_ws_reconnect(self) -> None:
+        if self._closing:
+            return
+        with self._ws_lock:
+            if self._ws_reconnect_timer and self._ws_reconnect_timer.is_alive():
+                return
+            self._ws_reconnect_attempts = min(self._ws_reconnect_attempts + 1, 8)
+            delay = min(60.0, 2.0 ** self._ws_reconnect_attempts)
+            self.logger.info(
+                "Scheduling websocket reconnect in %.1f seconds (attempt %d)",
+                delay,
+                self._ws_reconnect_attempts,
+                extra={
+                    "gateway_state": "ws_reconnect_scheduled",
+                    "latency_ms": int(delay * 1000),
+                },
+            )
+            timer = Timer(delay, self._perform_ws_reconnect)
+            timer.daemon = True
+            self._ws_reconnect_timer = timer
+            timer.start()
+
+    def _cancel_ws_reconnect(self) -> None:
+        with self._ws_lock:
+            if self._ws_reconnect_timer:
+                self._ws_reconnect_timer.cancel()
+                self._ws_reconnect_timer = None
+            self._ws_reconnect_attempts = 0
+
+    def _perform_ws_reconnect(self) -> None:
+        with self._ws_lock:
+            self._ws_reconnect_timer = None
+        if self._closing:
+            return
+        try:
+            self._prepare_realtime()
+            self._ensure_websocket_client(register_handler=True)
+            self.logger.info(
+                "Websocket reconnect successful.",
+                extra={"gateway_state": "ws_reconnected"},
+            )
+            self._start_token_refresh()
+        except Exception as exc:  # pragma: no cover - vendor behaviour
+            self.logger.warning(
+                "Websocket reconnect failed: %s",
+                exc,
+                extra={"gateway_state": "ws_reconnect_failed"},
+            )
+            self._schedule_ws_reconnect()
+
+    def _apply_account_context(self, account_id: str) -> bool:
+        if self.client is None:
+            return True
+        setter_candidates = (
+            "switch_account",
+            "set_account",
+            "set_current_account",
+            "select_account",
+        )
+        for name in setter_candidates:
+            method = getattr(self.client, name, None)
+            if not callable(method):
+                continue
+            try:
+                result = method(account_id)
+                success = True if result is None else bool(result)
+                if success:
+                    self.logger.debug("Applied account context via %s", name)
+                    return True
+                self.logger.warning(
+                    "Account setter %s returned falsy result while switching to %s.",
+                    name,
+                    account_id,
+                )
+            except Exception as exc:  # pragma: no cover - vendor behaviour
+                self.logger.warning(
+                    "Applying account via %s failed: %s",
+                    name,
+                    exc,
+                    extra={"gateway_state": "account_warning"},
+                )
+        for attr_name in ("account_id", "account", "current_account"):
+            if hasattr(self.client, attr_name):
+                try:
+                    setattr(self.client, attr_name, account_id)
+                    self.logger.debug("Set client.%s = %s", attr_name, account_id)
+                    return True
+                except Exception as exc:  # pragma: no cover
+                    self.logger.warning(
+                        "Setting client.%s failed: %s",
+                        attr_name,
+                        exc,
+                        extra={"gateway_state": "account_warning"},
+                    )
+        return False
+
+    def _validate_account_context(self, account_id: str) -> bool:
+        if self.client is None:
+            return True
+        getter_candidates = (
+            "get_current_account",
+            "current_account",
+            "account_id",
+            "account",
+        )
+        for name in getter_candidates:
+            attr = getattr(self.client, name, None)
+            if attr is None:
+                continue
+            try:
+                current = attr() if callable(attr) else attr
+            except Exception:  # pragma: no cover - vendor behaviour
+                continue
+            candidate = self._resolve_candidate_account_id(current)
+            if not candidate:
+                continue
+            if candidate != account_id:
+                warning = (
+                    f"SDK reports active account {candidate} after switching to {account_id}."
+                )
+                self.logger.warning(warning, extra={"gateway_state": "account_warning"})
+                self._put_event(EVENT_LOG, warning)
+                return False
+            return True
+        return True
+
+    def switch_account(self, account_id: str) -> bool:
+        account_id = str(account_id).strip()
+        account = self.account_map.get(account_id)
+        if not account:
+            self.logger.warning(
+                "Account %s not available in login response.",
+                account_id,
+                extra={"gateway_state": "account_warning"},
+            )
+            return False
+
+        previous_primary = self.primary_account
+        previous_primary_id = self.primary_account_id
+        previous_order_account: Optional[str] = None
+        if self.order_api:
+            previous_order_account = self.order_api.account_id
+
+        applied = self._apply_account_context(account_id)
+        if not applied:
+            self.logger.warning(
+                "Account switch to %s failed: SDK refused to change context.", account_id
+            )
+            if previous_primary_id and previous_primary_id != account_id:
+                self._apply_account_context(previous_primary_id)
+            return False
+
+        success = self._validate_account_context(account_id)
+        if success:
+            self.primary_account = account
+            self.primary_account_id = account_id
+            if self.order_api:
+                self.order_api.account_id = account_id
+            self.write_log(f"Switched primary account to {account_id}.")
+            return True
+
+        if self.order_api:
+            self.order_api.account_id = previous_order_account
+        self.primary_account = previous_primary
+        self.primary_account_id = previous_primary_id
+        if previous_primary_id and previous_primary_id != account_id:
+            self._apply_account_context(previous_primary_id)
+        self.logger.warning(
+            "Account switch to %s failed validation; continuing to use %s.",
+            account_id,
+            previous_primary_id or "current session",
+            extra={"gateway_state": "account_warning"},
+        )
+        return False
+
+    def get_available_accounts(self) -> Sequence[str]:
+        return list(sorted(self.account_metadata.keys()))
+
+    def get_account_metadata(self) -> Sequence[Mapping[str, Any]]:
+        return [dict(metadata) for metadata in self.account_metadata.values()]
+
+    def _put_event(self, event_type: str, data: Any) -> None:
+        payload = data
+        if event_type == EVENT_LOG and isinstance(data, str):
+            try:
+                payload = LogData(msg=data, gateway_name=self.gateway_name)
+            except Exception:
+                payload = data
+        event = Event(event_type, payload)
+        put = getattr(self.event_engine, "put", None)
+        if callable(put):
+            put(event)
+        else:
+            self.event_engine(event)
+
+    def write_log(self, message: str, *, state: str = "info") -> None:
+        super().write_log(message)
+        self.logger.info(message, extra={"gateway_state": state})
+
+    # ------------------------------------------------------------------
+    # Convenience aliases (legacy compatibility)
+
+    def stop(self) -> None:  # pragma: no cover - legacy entry point
+        self.close()
