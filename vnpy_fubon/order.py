@@ -19,6 +19,22 @@ from .mappings import (
 )
 from .vnpy_compat import Direction, Exchange, Offset, OrderData, OrderRequest, OrderStatus, TradeData
 
+try:  # pragma: no cover - optional vendor dependencies
+    from fubon_neo.constant import (
+        BSAction,
+        FutOptMarketType,
+        FutOptOrderType,
+        FutOptPriceType,
+        TimeInForce,
+    )
+except ImportError:  # pragma: no cover - fallback when SDK unavailable
+    BSAction = FutOptMarketType = FutOptOrderType = FutOptPriceType = TimeInForce = None  # type: ignore[assignment]
+
+try:  # pragma: no cover - optional vendor dependencies
+    from fubon_neo.sdk import Order as SDKOrder
+except ImportError:  # pragma: no cover - fallback when SDK unavailable
+    SDKOrder = None  # type: ignore[assignment]
+
 PLACE_ORDER_METHODS = ("place_order", "insert_order", "Order")
 CANCEL_ORDER_METHODS = ("cancel_order", "CancelOrder", "delete_order")
 QUERY_ORDER_METHODS = ("query_orders", "get_orders", "QueryOrderList")
@@ -104,14 +120,23 @@ class OrderAPI:
         request: OrderRequest | Mapping[str, Any],
         extra_payload: Optional[Mapping[str, Any]] = None,
     ) -> OrderData:
-        method = self._resolve_method(PLACE_ORDER_METHODS)
         payload = self._build_order_payload(request)
         if extra_payload:
             payload.update(extra_payload)
 
+        futopt = getattr(self.client, "futopt", None)
+        futopt_place = getattr(futopt, "place_order", None) if futopt else None
+        if callable(futopt_place):
+            order = self._place_order_via_futopt(futopt_place, payload)
+            if order is not None:
+                return order
+
+        method = self._resolve_method(PLACE_ORDER_METHODS)
+
         self.logger.debug("Placing order with payload %s", payload)
         response = method(**payload)
-        order_data = self._to_order_data(response, payload)
+        order_payload = self._unwrap_order_response(response)
+        order_data = self._to_order_data(order_payload, payload)
         self.logger.info("Order placed: %s (raw=%s)", order_data, response)
         return order_data
 
@@ -168,6 +193,51 @@ class OrderAPI:
             f"OrderAPI cannot find any of {candidates} on client {type(self.client).__name__}"
         )
 
+    def _place_order_via_futopt(self, place_method: Any, payload: Mapping[str, Any]) -> Optional[OrderData]:
+        order_args = self._build_futopt_order_args(payload)
+        if order_args is None:
+            return None
+
+        account_obj = self._get_sdk_account(payload.get("account"), payload.get("account_id"))
+        if account_obj is None:
+            account_obj = self._get_sdk_account()
+        if account_obj is None:
+            self.logger.debug(
+                "Unable to resolve account object for place_order %s; falling back to legacy signature.",
+                payload,
+            )
+            return None
+
+        order_obj = order_args["order"]
+        unblock = order_args.get("unblock")
+        try:
+            if unblock is not None:
+                response = place_method(account_obj, order_obj, unblock=unblock)
+            else:
+                response = place_method(account_obj, order_obj)
+        except TypeError:
+            try:
+                if unblock is not None:
+                    response = place_method(account_obj, order_obj, unblock)
+                else:
+                    response = place_method(account_obj, order_obj)
+            except Exception as exc:
+                self.logger.debug(
+                    "FutOpt place_order invocation failed for %s: %s",
+                    payload,
+                    exc,
+                    exc_info=True,
+                )
+                return None
+        except Exception as exc:
+            self.logger.warning("FutOpt place_order raised for payload %s: %s", payload, exc)
+            raise
+
+        order_payload = self._unwrap_order_response(response)
+        order_data = self._to_order_data(order_payload, payload)
+        self.logger.info("Order placed via FutOpt: %s (raw=%s)", order_data, response)
+        return order_data
+
     def _cancel_order_via_futopt(
         self,
         cancel_method: Any,
@@ -223,6 +293,164 @@ class OrderAPI:
         result = self._interpret_response_success(response)
         self.logger.info("Cancel result for %s -> %s (raw=%s)", order_id, result, response)
         return result
+
+    def _build_futopt_order_args(self, payload: Mapping[str, Any]) -> Optional[Mapping[str, Any]]:
+        if SDKOrder is None:
+            return None
+
+        symbol = str(payload.get("symbol") or "").strip()
+        if not symbol:
+            return None
+
+        quantity_raw = payload.get("quantity") or payload.get("volume")
+        try:
+            quantity = int(Decimal(str(quantity_raw or 0)))
+        except (InvalidOperation, ValueError):
+            quantity = 0
+        if quantity <= 0:
+            self.logger.debug("Invalid quantity for FutOpt order payload %s", payload)
+            return None
+
+        price_raw = payload.get("price")
+        price = None
+        if price_raw not in (None, ""):
+            try:
+                price = float(price_raw)
+            except (TypeError, ValueError):
+                price = None
+
+        side = payload.get("side") or payload.get("direction")
+        bs_action = self._map_bs_action(side)
+        if bs_action is None and BSAction is not None:
+            bs_action = getattr(BSAction, "Buy") if price is not None else getattr(BSAction, "Sell")
+
+        order_type = self._map_order_type(payload)
+        price_type = self._map_price_type(payload, price)
+        time_in_force = self._map_time_in_force(payload)
+        market_type = self._map_market_type(payload, symbol)
+        user_def = payload.get("user_def")
+        unblock = payload.get("unblock")
+
+        if bs_action is None:
+            self.logger.debug("Unable to determine BSAction for FutOpt order payload %s", payload)
+            return None
+
+        order_obj = SDKOrder(
+            bs_action,
+            symbol,
+            quantity,
+            market_type,
+            price_type,
+            time_in_force,
+            order_type,
+            price=price,
+            user_def=user_def,
+        )
+        return {"order": order_obj, "unblock": unblock}
+
+    def _map_bs_action(self, side: Any) -> Any:
+        if BSAction is None:
+            return side
+        if isinstance(side, BSAction):
+            return side
+        text = str(side or "").strip()
+        if not text and hasattr(BSAction, "UnDefined"):
+            return getattr(BSAction, "UnDefined")
+        if not text:
+            return None
+        upper = text.upper()
+        if upper in {"BUY", "LONG"}:
+            return getattr(BSAction, "Buy", None)
+        if upper in {"SELL", "SHORT"}:
+            return getattr(BSAction, "Sell", None)
+        return self._enum_member(BSAction, text)
+
+    def _map_time_in_force(self, payload: Mapping[str, Any]) -> Any:
+        code = payload.get("time_in_force") or payload.get("tif") or payload.get("order_type")
+        if TimeInForce is None:
+            return code or "ROD"
+        candidate = self._enum_member(TimeInForce, code)
+        if candidate:
+            return candidate
+        return getattr(TimeInForce, "ROD", code or "ROD")
+
+    def _map_price_type(self, payload: Mapping[str, Any], price: Optional[float]) -> Any:
+        code = payload.get("price_type")
+        if code is None and price is None:
+            code = "Market"
+        elif code is None:
+            code = "Limit"
+        if FutOptPriceType is None:
+            return code
+        candidate = self._enum_member(FutOptPriceType, code)
+        if candidate:
+            return candidate
+        default_attr = "Market" if price is None else "Limit"
+        return getattr(FutOptPriceType, default_attr, code)
+
+    def _map_order_type(self, payload: Mapping[str, Any]) -> Any:
+        code = payload.get("futopt_order_type") or payload.get("order_type")
+        offset = payload.get("offset")
+        if FutOptOrderType is None:
+            if isinstance(offset, str) and offset.lower() in {"close", "closetoday", "closeyesterday"}:
+                return "Close"
+            return code or "New"
+        candidate = self._enum_member(FutOptOrderType, code)
+        if candidate:
+            return candidate
+        if isinstance(offset, str):
+            lower_offset = offset.lower()
+            if lower_offset in {"close", "closetoday", "closeyesterday"}:
+                return getattr(FutOptOrderType, "Close", None) or getattr(FutOptOrderType, "UnDefined", None)
+        return getattr(FutOptOrderType, "New", None) or code
+
+    def _map_market_type(self, payload: Mapping[str, Any], symbol: str) -> Any:
+        code = payload.get("market_type") or payload.get("marketType")
+        if FutOptMarketType is None:
+            return code or "Future"
+        candidate = self._enum_member(FutOptMarketType, code)
+        if candidate:
+            return candidate
+
+        # Heuristic based on symbol prefix for options (commonly contain alphabetic suffix)
+        if symbol.upper().startswith(("TXO", "TFO", "XO", "O")):
+            return getattr(FutOptMarketType, "Option", None)
+        return getattr(FutOptMarketType, "Future", None)
+
+    def _enum_member(self, enum_cls: Any, value: Any) -> Optional[Any]:
+        if enum_cls is None or value is None:
+            return None
+        if isinstance(value, enum_cls):
+            return value
+        text = str(value).strip()
+        if not text:
+            return None
+        lower = text.lower()
+        for attr in dir(enum_cls):
+            if attr.startswith("_"):
+                continue
+            member = getattr(enum_cls, attr)
+            if not isinstance(member, enum_cls):
+                continue
+            if attr.lower() == lower:
+                return member
+            member_name = str(member).split(".")[-1].lower()
+            if member_name == lower:
+                return member
+        return None
+
+    def _unwrap_order_response(self, response: Any) -> Any:
+        if isinstance(response, Mapping):
+            return response
+        data_attr = getattr(response, "data", None)
+        if data_attr is not None:
+            if isinstance(data_attr, Mapping):
+                return data_attr
+            if isinstance(data_attr, (list, tuple)) and data_attr:
+                first = data_attr[0]
+                if isinstance(first, Mapping):
+                    return first
+        return response
 
     def _get_sdk_account(self, account: Any = None, account_id: Optional[str] = None) -> Optional[Any]:
         if account is not None:
@@ -390,6 +618,7 @@ class OrderAPI:
             order_type = ORDER_TYPE_REVERSE_MAP.get(request.type, "ROD")
             price = request.price
             volume = request.volume
+            offset = request.offset
         elif isinstance(request, Mapping):
             symbol = str(request.get("symbol"))
             exchange = request.get("exchange")
@@ -397,6 +626,7 @@ class OrderAPI:
             order_type = request.get("order_type") or request.get("type") or "ROD"
             price = request.get("price")
             volume = request.get("volume") or request.get("quantity")
+            offset = request.get("offset")
         else:
             raise TypeError(f"Unsupported order request type {type(request)}")
 
@@ -408,6 +638,13 @@ class OrderAPI:
                 getattr(Direction, direction.upper(), Direction.LONG)
             )
 
+        if isinstance(offset, Offset):
+            offset_code = str(offset).split(".")[-1]
+        elif isinstance(offset, str):
+            offset_code = offset.split(".")[-1]
+        else:
+            offset_code = None
+
         payload = {
             "symbol": symbol,
             "exchange": str(exchange) if exchange else None,
@@ -415,7 +652,12 @@ class OrderAPI:
             "order_type": order_type,
             "price": float(price) if price is not None else None,
             "quantity": float(volume) if volume is not None else None,
+            "offset": offset_code,
         }
+        if payload.get("price_type") is None:
+            payload["price_type"] = "Market" if payload.get("price") is None else "Limit"
+        if payload.get("time_in_force") is None:
+            payload["time_in_force"] = "ROD"
         if self.account_id:
             payload.setdefault("account_id", self.account_id)
         return {key: value for key, value in payload.items() if value is not None}

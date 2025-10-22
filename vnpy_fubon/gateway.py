@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+import time
 from datetime import datetime, timezone
 from threading import Timer
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Set, Tuple
@@ -554,6 +555,52 @@ class FubonGateway(BaseGateway):
     # ------------------------------------------------------------------
     # Internal helpers
 
+    def _call_rest_with_retry(
+        self,
+        func: Callable[..., Any],
+        *args: Any,
+        max_attempts: int = 5,
+        base_delay: float = 0.5,
+        **kwargs: Any,
+    ) -> Any:
+        attempt = 0
+        delay = base_delay
+        while True:
+            try:
+                return func(*args, **kwargs)
+            except Exception as exc:
+                attempt += 1
+                if attempt >= max_attempts or not self._is_rate_limit_error(exc):
+                    raise
+                self.logger.debug(
+                    "REST rate limit encountered for %s; retrying in %.2f seconds (attempt %s/%s).",
+                    getattr(func, "__name__", repr(func)),
+                    delay,
+                    attempt,
+                    max_attempts,
+                )
+                time.sleep(delay)
+                delay = min(delay * 2, 8.0)
+
+    def _is_rate_limit_error(self, exc: Exception) -> bool:
+        status_candidates = (
+            getattr(exc, "status_code", None),
+            getattr(exc, "status", None),
+        )
+        for status in status_candidates:
+            if status == 429:
+                return True
+
+        response = getattr(exc, "response", None)
+        if response is not None:
+            status = getattr(response, "status_code", None)
+            if status == 429:
+                return True
+
+        message = str(exc).lower()
+        keywords = ("429", "too many requests", "rate limit")
+        return any(keyword in message for keyword in keywords)
+
     def _fetch_contracts_from_rest(self) -> List[Tuple[ContractData, str, str]]:
         intraday = self._get_intraday_client()
         if intraday is None:
@@ -572,8 +619,11 @@ class FubonGateway(BaseGateway):
         contracts: Dict[str, Tuple[ContractData, str, str]] = {}
         for params in query_params:
             try:
-                response = intraday.tickers(
-                    exchange=self._default_exchange_code, limit=2000, **params
+                response = self._call_rest_with_retry(
+                    intraday.tickers,
+                    exchange=self._default_exchange_code,
+                    limit=2000,
+                    **params,
                 )
             except Exception as exc:  # pragma: no cover - vendor behaviour
                 self.logger.debug("intraday.tickers failed for %s: %s", params, exc)
@@ -620,8 +670,11 @@ class FubonGateway(BaseGateway):
 
         for params in product_params:
             try:
-                response = intraday.products(
-                    exchange=self._default_exchange_code, limit=2000, **params
+                response = self._call_rest_with_retry(
+                    intraday.products,
+                    exchange=self._default_exchange_code,
+                    limit=2000,
+                    **params,
                 )
             except Exception as exc:  # pragma: no cover - vendor behaviour
                 self.logger.debug("intraday.products failed for %s: %s", params, exc)
@@ -946,6 +999,8 @@ class FubonGateway(BaseGateway):
 
             self._ws_client = None
             self._active_subscriptions.clear()
+            self._subscription_ids_by_key.clear()
+            self._subscription_key_by_id.clear()
             self._cancel_ws_reconnect()
 
     def _resubscribe_all(self) -> None:
@@ -956,7 +1011,14 @@ class FubonGateway(BaseGateway):
             if after_hours is not None:
                 payload["afterHours"] = bool(after_hours)
             try:
-                self._ws_client.subscribe(payload)
+                response = self._ws_client.subscribe(payload)
+                parsed_ids = self._parse_subscription_ids(response, [symbol])
+                if parsed_ids:
+                    sub_id = parsed_ids.get(symbol)
+                    if sub_id:
+                        key = (channel, symbol, after_hours)
+                        self._subscription_ids_by_key[key] = sub_id
+                        self._subscription_key_by_id[sub_id] = key
                 self.logger.debug(
                     "Re-subscribed websocket channel %s",
                     payload,
