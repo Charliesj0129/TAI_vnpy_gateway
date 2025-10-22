@@ -8,11 +8,11 @@ the module provides light-weight stand-ins that mimic the expected interface.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
 from enum import Enum
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Dict, Optional
 
 try:  # pragma: no cover - exercised only when vn.py is installed
     from vnpy.event import Event
@@ -134,6 +134,52 @@ except ImportError:  # pragma: no cover - default for most development environme
         currency: str
         gateway_name: str
         timestamp: Optional[datetime] = None
+        yesterday_balance: Decimal = Decimal("0")
+        today_balance: Decimal = Decimal("0")
+        today_equity: Decimal = Decimal("0")
+        initial_margin: Decimal = Decimal("0")
+        maintenance_margin: Decimal = Decimal("0")
+        clearing_margin: Decimal = Decimal("0")
+        excess_margin: Decimal = Decimal("0")
+        available_margin: Decimal = Decimal("0")
+        disgorgement: Decimal = Decimal("0")
+        fut_realized_pnl: Decimal = Decimal("0")
+        fut_unrealized_pnl: Decimal = Decimal("0")
+        opt_value: Decimal = Decimal("0")
+        opt_long_value: Decimal = Decimal("0")
+        opt_short_value: Decimal = Decimal("0")
+        opt_pnl: Decimal = Decimal("0")
+        today_fee: Decimal = Decimal("0")
+        today_tax: Decimal = Decimal("0")
+        today_cash_in: Decimal = Decimal("0")
+        today_cash_out: Decimal = Decimal("0")
+        extra: Dict[str, Any] = field(default_factory=dict)
+
+    @dataclass
+    class EquityData:
+        accountid: str
+        currency: str
+        today_equity: Decimal
+        yesterday_balance: Decimal
+        today_balance: Decimal
+        initial_margin: Decimal
+        maintenance_margin: Decimal
+        clearing_margin: Decimal
+        excess_margin: Decimal
+        available_margin: Decimal
+        disgorgement: Decimal
+        fut_realized_pnl: Decimal
+        fut_unrealized_pnl: Decimal
+        opt_value: Decimal
+        opt_long_value: Decimal
+        opt_short_value: Decimal
+        opt_pnl: Decimal
+        today_fee: Decimal
+        today_tax: Decimal
+        today_cash_in: Decimal
+        today_cash_out: Decimal
+        timestamp: Optional[datetime] = None
+        extra: Dict[str, Any] = field(default_factory=dict)
 
 
     @dataclass
@@ -328,6 +374,7 @@ __all__ = [
     "ContractData",
     "Direction",
     "Exchange",
+    "EquityData",
     "Event",
     "BarData",
     "LogData",

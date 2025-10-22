@@ -38,6 +38,7 @@ from .vnpy_compat import (
     OrderData,
     OrderRequest,
     PositionData,
+    EquityData,
     Exchange,
     Product,
     SubscribeRequest,
@@ -621,6 +622,28 @@ class FubonGateway(BaseGateway):
         self._put_event(EVENT_LOG, f"Account {account.accountid} queried.")
         return account
 
+    def query_equity(self, account_id: Optional[str] = None) -> Sequence[EquityData]:
+        if not self.account_api:
+            return []
+        if account_id:
+            account_obj = self.account_map.get(str(account_id))
+            if not account_obj:
+                self.logger.warning("Account %s not found for equity query.", account_id)
+                return []
+        else:
+            account_obj = self.primary_account
+        if not account_obj:
+            self.logger.warning("No active account available for equity query.")
+            return []
+        equities = self.account_api.query_margin_equity(account_obj)
+        for equity in equities:
+            log_message = (
+                f"Equity snapshot for {equity.accountid} ({equity.currency}) - "
+                f"today_equity={equity.today_equity} excess_margin={equity.excess_margin}"
+            )
+            self._put_event(EVENT_LOG, log_message)
+        return equities
+
     def query_positions(self) -> Sequence[PositionData]:
         if not self.account_api:
             return []
@@ -898,6 +921,114 @@ class FubonGateway(BaseGateway):
             self._populate_option_fields(contract, ticker, metadata)
 
         return contract, raw_symbol, str(exchange_code or "")
+
+    def fetch_candles(
+        self,
+        symbol: str,
+        *,
+        session: Optional[str] = None,
+        timeframe: Optional[int] = None,
+        limit: Optional[int] = None,
+    ) -> List[BarData]:
+        intraday = self._get_intraday_client()
+        if intraday is None:
+            raise RuntimeError("REST intraday client unavailable; call connect() first.")
+
+        params: Dict[str, Any] = {"symbol": symbol}
+        if session:
+            params["session"] = session
+        if timeframe:
+            params["timeframe"] = timeframe
+        if limit:
+            params["limit"] = limit
+
+        response = self._call_rest_with_retry(intraday.candles, **params)
+        data_entries = response.get("data") or []
+        exchange = response.get("exchange") or self._default_exchange_code
+
+        bars: List[BarData] = []
+        for entry in data_entries:
+            entry_map = dict(entry)
+            entry_map.setdefault("symbol", response.get("symbol") or symbol)
+            entry_map.setdefault("exchange", exchange)
+            entry_map.setdefault("timeframe", response.get("timeframe") or timeframe)
+            entry_map.setdefault("date", entry.get("time"))
+            bar = self._normalize_market_bar(entry_map)
+            if bar:
+                bars.append(bar)
+        return bars
+
+    def fetch_trades_history(
+        self,
+        symbol: str,
+        *,
+        session: Optional[str] = None,
+        offset: Optional[int] = None,
+        limit: Optional[int] = None,
+    ) -> List[TradeData]:
+        intraday = self._get_intraday_client()
+        if intraday is None:
+            raise RuntimeError("REST intraday client unavailable; call connect() first.")
+
+        params: Dict[str, Any] = {"symbol": symbol}
+        if session:
+            params["session"] = session
+        if offset is not None:
+            params["offset"] = offset
+        if limit is not None:
+            params["limit"] = limit
+
+        response = self._call_rest_with_retry(intraday.trades, **params)
+        data_entries = response.get("data") or []
+        exchange = response.get("exchange") or self._default_exchange_code
+
+        trades: List[TradeData] = []
+        for entry in data_entries:
+            normalized_entry = {
+                "matchTime": entry.get("time"),
+                "price": entry.get("price"),
+                "matchQty": entry.get("size"),
+                "serial": entry.get("serial"),
+                "tradeId": entry.get("serial"),
+                "orderId": entry.get("orderId"),
+                "side": entry.get("side"),
+            }
+            payload = {
+                "channel": "trades",
+                "symbol": symbol,
+                "exchange": exchange,
+                "trades": [normalized_entry],
+            }
+            trade = self._normalize_market_trade(payload)
+            if trade:
+                trades.append(trade)
+        return trades
+
+    def fetch_volume_profile(
+        self,
+        symbol: str,
+        *,
+        session: Optional[str] = None,
+    ) -> List[Mapping[str, float]]:
+        intraday = self._get_intraday_client()
+        if intraday is None:
+            raise RuntimeError("REST intraday client unavailable; call connect() first.")
+
+        params: Dict[str, Any] = {"symbol": symbol}
+        if session:
+            params["session"] = session
+
+        response = self._call_rest_with_retry(intraday.volumes, **params)
+        data_entries = response.get("data") or []
+        volumes: List[Mapping[str, float]] = []
+        for entry in data_entries:
+            volumes.append(
+                {
+                    "price": float(self._safe_float(entry.get("price"))),
+                    "volume": float(self._safe_float(entry.get("volume"))),
+                }
+            )
+        return volumes
 
     def _match_product_symbol(
         self, contract_symbol: str, product_metadata: Mapping[str, Mapping[str, Any]]
