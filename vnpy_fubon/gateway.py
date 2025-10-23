@@ -5,6 +5,7 @@ manages account, order, and market data flows for the Fubon Securities SDK.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import threading
@@ -55,6 +56,11 @@ try:  # pragma: no cover - optional SDK dependency
     from fubon_neo.sdk import Mode
 except ImportError:  # pragma: no cover - graceful degradation
     Mode = None  # type: ignore[assignment]
+
+try:  # pragma: no cover - optional SDK dependency
+    from fubon_neo.constant import CallPut
+except ImportError:  # pragma: no cover - graceful degradation
+    CallPut = None  # type: ignore[assignment]
 
 class FubonGateway(BaseGateway):
     """
@@ -107,12 +113,16 @@ class FubonGateway(BaseGateway):
         self._subscription_key_by_id: Dict[str, Tuple[str, str, Optional[bool]]] = {}
         self._ws_reconnect_attempts = 0
         self._ws_reconnect_timer: Optional[Timer] = None
+        self._ws_ping_timer: Optional[Timer] = None
+        self._ws_ping_interval = int(os.getenv("FUBON_WS_PING_INTERVAL", "30"))
         self._closing = False
         self._ws_sdk_callbacks: list[Tuple[str, Callable[..., None]]] = []
         self._token_timer: Optional[Timer] = None
         self._token_refresh_interval = 900  # seconds; aligns with 15-minute default heartbeat
         self._market_normalizer: Optional[MarketEnvelopeNormalizer] = None
         self._preferred_ws_mode = os.getenv("FUBON_REALTIME_MODE", "Normal")
+        self._normal_mode_warning_emitted = False
+        self._subscription_warning_emitted = False
 
     # ----------------------------------------------------------------------
     # vn.py BaseGateway interface
@@ -220,6 +230,16 @@ class FubonGateway(BaseGateway):
         if not unique_symbols:
             return
 
+        requires_normal = any(ch.lower() in {"candles", "candle", "aggregates", "aggregate"} for ch in payload_channels)
+        if requires_normal and not self._is_normal_mode() and not self._normal_mode_warning_emitted:
+            warning = (
+                "SDK realtime mode is not Normal; aggregates/candles subscriptions may be rejected. "
+                "Set FUBON_REALTIME_MODE=Normal before connecting."
+            )
+            self.logger.warning(warning, extra={"gateway_state": "ws_mode_warning"})
+            self._put_event(EVENT_LOG, warning)
+            self._normal_mode_warning_emitted = True
+
         for channel in payload_channels:
             pending_symbols = [
                 symbol
@@ -228,6 +248,16 @@ class FubonGateway(BaseGateway):
             ]
             if not pending_symbols:
                 continue
+
+            projected_total = len(self._active_subscriptions) + len(pending_symbols)
+            if projected_total > 200 and not self._subscription_warning_emitted:
+                message = (
+                    f"Websocket subscriptions approaching vendor limit (current={len(self._active_subscriptions)}, "
+                    f"projected={projected_total}). Consider reducing channels per connection."
+                )
+                self.logger.warning(message, extra={"gateway_state": "subscription_warning"})
+                self._put_event(EVENT_LOG, message)
+                self._subscription_warning_emitted = True
 
             batch_completed = False
             if len(pending_symbols) > 1:
@@ -616,10 +646,46 @@ class FubonGateway(BaseGateway):
                     return member
         return mode_value
 
+    def _is_normal_mode(self) -> bool:
+        mode = self._preferred_ws_mode
+        if Mode is not None and isinstance(mode, Mode):  # type: ignore[arg-type]
+            return mode == Mode.Normal
+        if isinstance(mode, str):
+            return mode.strip().lower() == "normal"
+        return True
+
     def _get_account_object(self, account_id: Optional[str]) -> Optional[Any]:
         if account_id:
             return self.account_map.get(str(account_id))
         return self.primary_account
+
+    def _coerce_call_put(self, value: Any) -> Any:
+        if value in (None, "", "null"):
+            return None
+        if CallPut is None:
+            if isinstance(value, str):
+                text = value.strip().lower()
+                if text in {"call", "c"}:
+                    return "Call"
+                if text in {"put", "p"}:
+                    return "Put"
+            return value
+        if isinstance(value, CallPut):  # type: ignore[arg-type]
+            return value
+        if isinstance(value, str):
+            text = value.strip().lower()
+            for member in CallPut:  # type: ignore[assignment]
+                member_name = getattr(member, "name", str(member)).lower()
+                if member_name == text:
+                    return member
+                member_value = str(member).split(".")[-1].lower()
+                if member_value == text:
+                    return member
+                if text in {"call", "c"} and member_name.startswith("call"):
+                    return member
+                if text in {"put", "p"} and member_name.startswith("put"):
+                    return member
+        return value
 
     def query_account(self) -> Optional[AccountData]:
         if not self.account_api:
@@ -690,6 +756,39 @@ class FubonGateway(BaseGateway):
                 f"Closed position {record.symbol} {record.direction} volume={record.volume} pnl={record.pnl}",
             )
         return records
+
+    def convert_symbol(
+        self,
+        base_symbol: str,
+        expiry_date: str,
+        *,
+        strike_price: Optional[float] = None,
+        call_put: Optional[Any] = None,
+    ) -> str:
+        if self.client is None:
+            raise RuntimeError("Gateway client unavailable.")
+        futopt = getattr(self.client, "futopt", None)
+        method = getattr(futopt, "convert_symbol", None) if futopt else None
+        if not callable(method):
+            raise FubonSDKMethodNotFoundError(
+                f"Client {type(self.client).__name__} does not expose futopt.convert_symbol."
+            )
+
+        kwargs: Dict[str, Any] = {}
+        if strike_price is not None:
+            kwargs["strike_price"] = strike_price
+        call_put_value = self._coerce_call_put(call_put)
+        if call_put_value is not None:
+            kwargs["call_put"] = call_put_value
+
+        result = method(base_symbol, expiry_date, **kwargs)
+        if isinstance(result, Mapping):
+            symbol = result.get("symbol") or result.get("data")
+            if isinstance(symbol, Mapping):
+                symbol = symbol.get("symbol")
+            if symbol:
+                return str(symbol)
+        return str(result)
 
     def query_positions(self) -> Sequence[PositionData]:
         if not self.account_api:
@@ -1317,6 +1416,7 @@ class FubonGateway(BaseGateway):
                     raise
                 self._resubscribe_all()
                 self._start_token_refresh()
+                self._start_ws_heartbeat()
 
             if register_handler:
                 self._register_ws_handlers()
@@ -1344,6 +1444,7 @@ class FubonGateway(BaseGateway):
             self._subscription_ids_by_key.clear()
             self._subscription_key_by_id.clear()
             self._cancel_ws_reconnect()
+            self._stop_ws_heartbeat()
 
     def _resubscribe_all(self) -> None:
         if not self._ws_client or not self._active_subscriptions:
@@ -1478,6 +1579,51 @@ class FubonGateway(BaseGateway):
         if self._token_timer:
             self._token_timer.cancel()
             self._token_timer = None
+
+    def _start_ws_heartbeat(self) -> None:
+        if self._closing or self._ws_ping_interval <= 0:
+            return
+        with self._ws_lock:
+            if not self._ws_connected or not self._ws_client:
+                return
+        self._stop_ws_heartbeat()
+        timer = Timer(self._ws_ping_interval, self._send_ws_ping)
+        timer.daemon = True
+        self._ws_ping_timer = timer
+        timer.start()
+
+    def _stop_ws_heartbeat(self) -> None:
+        if self._ws_ping_timer:
+            self._ws_ping_timer.cancel()
+            self._ws_ping_timer = None
+
+    def _send_ws_ping(self) -> None:
+        with self._ws_lock:
+            self._ws_ping_timer = None
+            ws = self._ws_client
+            connected = self._ws_connected
+        if not ws or not connected or self._closing:
+            return
+
+        ping_method = getattr(ws, "ping", None) or getattr(ws, "send_ping", None)
+        try:
+            if callable(ping_method):
+                ping_method()
+            else:
+                send_method = getattr(ws, "send", None) or getattr(ws, "write_message", None)
+                if callable(send_method):
+                    try:
+                        send_method(json.dumps({"event": "ping"}))
+                    except TypeError:
+                        send_method({"event": "ping"})
+        except Exception as exc:
+            self.logger.debug(
+                "Websocket ping failed: %s",
+                exc,
+                extra={"gateway_state": "ws_ping_failed"},
+            )
+        finally:
+            self._start_ws_heartbeat()
 
     def _refresh_token(self) -> None:
         with self._ws_lock:

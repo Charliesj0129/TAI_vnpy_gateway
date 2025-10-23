@@ -237,6 +237,10 @@ class MarketAPI:
             return "orderbook"
         if lower_channel in {"trades", "trade"}:
             return "trade"
+        if lower_channel in {"aggregates", "aggregate"}:
+            return "aggregate"
+        if lower_channel in {"candles", "candle"}:
+            return "candle"
 
         keys = {str(key).lower() for key in payload.keys()}
         price_keys = {"bid_price", "bestbidprice", "ask_price", "bestaskprice"}
@@ -247,6 +251,8 @@ class MarketAPI:
             return "orderbook"
         if {"trade_price", "trade_volume", "deal_price", "deal_volume"} & keys:
             return "trade"
+        if {"open", "high", "low", "close", "volume"} <= keys:
+            return "candle"
         if {"side", "price", "quantity"} <= keys and lower_channel == "":
             return "trade"
         if "price" in keys and "quantity" not in keys:
