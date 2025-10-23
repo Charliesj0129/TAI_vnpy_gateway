@@ -189,9 +189,15 @@ class OrderAPI:
 
         method = self._resolve_method(CANCEL_ORDER_METHODS)
         payload = {"order_id": order_id}
-        payload.update(kwargs)
+        safe_keys = ("account_id", "accountId", "market_type", "marketType")
+        for key in safe_keys:
+            if key in kwargs and kwargs[key] is not None:
+                payload[key] = kwargs[key]
         self.logger.debug("Cancelling order %s with payload %s", order_id, payload)
-        response = method(**payload)
+        try:
+            response = method(**payload)
+        except TypeError:
+            response = method(order_id=order_id)
         result = self._interpret_response_success(response)
         self.logger.info("Cancel result for %s -> %s (raw=%s)", order_id, result, response)
         return result
@@ -208,9 +214,8 @@ class OrderAPI:
                 f"Client {type(self.client).__name__} does not expose futopt module."
             )
 
-        maker = getattr(futopt, "make_modify_lot_obj", None)
         modify_method = getattr(futopt, "modify_lot", None)
-        if not callable(maker) or not callable(modify_method):
+        if not callable(modify_method):
             raise FubonSDKMethodNotFoundError(
                 f"modify_lot utilities missing on client {type(self.client).__name__}."
             )
@@ -221,13 +226,30 @@ class OrderAPI:
         if account_obj is None:
             raise RuntimeError("Unable to resolve account context for modify_lot.")
 
-        order_result = kwargs.get("order_result")
-        if order_result is None:
-            order_result = self._find_sdk_order_result_by_id(futopt, account_obj, order_id, kwargs)
-            if order_result is None:
-                raise ValueError(f"Order result for {order_id} not found; cannot modify lot.")
+        modify_obj = (
+            kwargs.get("futopt_modify_lot")
+            or kwargs.get("futOptModifyLot")
+            or kwargs.get("modify_obj")
+        )
+        order_result = kwargs.get("order_result") or kwargs.get("orderResult")
 
-        modify_obj = maker(order_result, int(new_lot))
+        if modify_obj is None:
+            if order_result is None:
+                order_result = self._find_sdk_order_result_by_id(
+                    futopt, account_obj, order_id, kwargs
+                )
+                if order_result is None:
+                    raise ValueError(f"Order result for {order_id} not found; cannot modify lot.")
+            maker = getattr(futopt, "make_modify_lot_obj", None)
+            if not callable(maker):
+                raise FubonSDKMethodNotFoundError(
+                    f"modify_lot utilities missing on client {type(self.client).__name__}."
+                )
+            modify_obj = maker(order_result, int(new_lot))
+
+        if modify_obj is None:
+            raise ValueError("FutOptModifyLot payload missing; cannot modify lot.")
+
         unblock = kwargs.get("unblock")
         try:
             if unblock is not None:

@@ -10,9 +10,10 @@ import logging
 import os
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta, time as dt_time, date as dt_date
 from threading import Timer
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Set, Tuple
+from math import ceil
 
 from adapters.fubon_to_vnpy import MarketEnvelopeNormalizer
 from .account import AccountAPI
@@ -61,6 +62,13 @@ try:  # pragma: no cover - optional SDK dependency
     from fubon_neo.constant import CallPut
 except ImportError:  # pragma: no cover - graceful degradation
     CallPut = None  # type: ignore[assignment]
+
+TAIPEI_TZ = timezone(timedelta(hours=8))
+DAY_SESSION_START = dt_time(8, 45)
+DAY_SESSION_END = dt_time(13, 45)
+NIGHT_SESSION_START = dt_time(15, 0)
+NIGHT_SESSION_END = dt_time(5, 0)
+DEFAULT_REST_CANDLES_LIMIT = 2000
 
 class FubonGateway(BaseGateway):
     """
@@ -126,6 +134,12 @@ class FubonGateway(BaseGateway):
         self._preferred_ws_mode = os.getenv("FUBON_REALTIME_MODE", "Normal")
         self._normal_mode_warning_emitted = False
         self._subscription_warning_emitted = False
+        try:
+            self._rest_candles_limit = max(
+                1, int(os.getenv("FUBON_REST_CANDLES_LIMIT", str(DEFAULT_REST_CANDLES_LIMIT)))
+            )
+        except ValueError:
+            self._rest_candles_limit = DEFAULT_REST_CANDLES_LIMIT
 
     # ----------------------------------------------------------------------
     # vn.py BaseGateway interface
@@ -744,20 +758,36 @@ class FubonGateway(BaseGateway):
         order_id: str,
         new_lot: int,
         *,
+        account: Optional[Any] = None,
         account_id: Optional[str] = None,
+        order_result: Optional[Any] = None,
+        futopt_modify_lot: Optional[Any] = None,
+        market_type: Optional[Any] = None,
         unblock: Optional[bool] = None,
     ) -> OrderData:
         if not self.order_api:
             raise RuntimeError("Gateway not connected.")
-        account_obj = self._get_account_object(account_id)
+        account_obj = account or self._get_account_object(account_id)
         if account_obj is None:
             raise RuntimeError("No account context available for modify_lot.")
+
+        kwargs: Dict[str, Any] = {"account": account_obj}
+        resolved_account_id = account_id or self.primary_account_id
+        if resolved_account_id:
+            kwargs["account_id"] = resolved_account_id
+        if order_result is not None:
+            kwargs["order_result"] = order_result
+        if futopt_modify_lot is not None:
+            kwargs["futopt_modify_lot"] = futopt_modify_lot
+        if market_type is not None:
+            kwargs["market_type"] = market_type
+        if unblock is not None:
+            kwargs["unblock"] = unblock
+
         result = self.order_api.modify_order_lot(
             order_id,
             new_lot,
-            account=account_obj,
-            account_id=account_id or self.primary_account_id,
-            unblock=unblock,
+            **kwargs,
         )
         self._put_event(EVENT_ORDER, result)
         self.write_log(
@@ -864,10 +894,34 @@ class FubonGateway(BaseGateway):
         self._put_event(EVENT_ORDER, order)
         return order
 
-    def cancel_order(self, order_id: str) -> bool:
+    def cancel_order(
+        self,
+        order_id: str,
+        *,
+        account: Optional[Any] = None,
+        account_id: Optional[str] = None,
+        order_result: Optional[Any] = None,
+        market_type: Optional[Any] = None,
+        unblock: Optional[bool] = None,
+    ) -> bool:
         if not self.order_api:
             raise RuntimeError("Gateway not connected.")
-        result = self.order_api.cancel_order(order_id)
+
+        account_obj = account or self._get_account_object(account_id)
+        kwargs: Dict[str, Any] = {}
+        if account_obj is not None:
+            kwargs["account"] = account_obj
+        resolved_account_id = account_id or self.primary_account_id
+        if resolved_account_id:
+            kwargs["account_id"] = resolved_account_id
+        if order_result is not None:
+            kwargs["order_result"] = order_result
+        if market_type is not None:
+            kwargs["market_type"] = market_type
+        if unblock is not None:
+            kwargs["unblock"] = unblock
+
+        result = self.order_api.cancel_order(order_id, **kwargs)
         if result:
             self.write_log(f"Cancel request for order {order_id} submitted.")
         return result
@@ -1189,7 +1243,18 @@ class FubonGateway(BaseGateway):
         if timeframe:
             params["timeframe"] = timeframe
         if limit:
-            params["limit"] = limit
+            try:
+                requested_limit = int(limit)
+            except (TypeError, ValueError):
+                requested_limit = self._rest_candles_limit
+            effective_limit = min(requested_limit, self._rest_candles_limit)
+            if requested_limit > self._rest_candles_limit:
+                self.logger.debug(
+                    "Requested %s bars exceeds REST limit %s; trimming request.",
+                    requested_limit,
+                    self._rest_candles_limit,
+                )
+            params["limit"] = effective_limit
 
         response = self._call_rest_with_retry(intraday.candles, **params)
         data_entries = response.get("data") or []
@@ -1213,33 +1278,59 @@ class FubonGateway(BaseGateway):
     ) -> Tuple[Optional[Any], Optional[int]]:
         value: Optional[Any] = getattr(interval, "value", interval) if interval is not None else None
         if value is None:
-            return ("1m", 1)
+            return ("1", 1)
 
         if isinstance(value, str):
+            sanitized = value.strip().lower()
             mapping: Dict[str, Tuple[Optional[Any], Optional[int]]] = {
-                "1m": ("1m", 1),
-                "3m": ("3m", 3),
-                "5m": ("5m", 5),
-                "15m": ("15m", 15),
-                "30m": ("30m", 30),
-                "60m": ("60m", 60),
-                "1h": ("1h", 60),
-                "d": ("1d", 1440),
-                "1d": ("1d", 1440),
-                "day": ("1d", 1440),
-                "w": ("1w", 10080),
-                "1w": ("1w", 10080),
-                "week": ("1w", 10080),
-                "tick": (None, None),
+                "1": ("1", 1),
+                "1m": ("1", 1),
+                "minute": ("1", 1),
+                "5": ("5", 5),
+                "5m": ("5", 5),
+                "10": ("10", 10),
+                "10m": ("10", 10),
+                "15": ("15", 15),
+                "15m": ("15", 15),
+                "30": ("30", 30),
+                "30m": ("30", 30),
+                "60": ("60", 60),
+                "60m": ("60", 60),
+                "1h": ("60", 60),
+                "hour": ("60", 60),
             }
-            resolved = mapping.get(value.lower())
+            resolved = mapping.get(sanitized)
             if resolved:
                 return resolved
+            if sanitized.endswith("m") and sanitized[:-1].isdigit():
+                minutes = int(sanitized[:-1])
+                return self._coerce_intraday_timeframe(minutes)
+            if sanitized.endswith("h") and sanitized[:-1].isdigit():
+                minutes = int(sanitized[:-1]) * 60
+                return self._coerce_intraday_timeframe(minutes)
+            if sanitized.isdigit():
+                minutes = int(sanitized)
+                return self._coerce_intraday_timeframe(minutes)
+            if sanitized in {"d", "1d", "day", "daily", "w", "1w", "week", "weekly", "tick"}:
+                return (None, None)
 
         if isinstance(value, (int, float)):
             minutes = int(value)
-            return (minutes, minutes)
+            return self._coerce_intraday_timeframe(minutes)
 
+        return (None, None)
+
+    def _coerce_intraday_timeframe(self, minutes: int) -> Tuple[Optional[str], Optional[int]]:
+        supported_minutes = (1, 5, 10, 15, 30, 60)
+        if minutes <= 0:
+            return (None, None)
+        if minutes in supported_minutes:
+            return (str(minutes), minutes)
+        self.logger.warning(
+            "Fubon intraday candles do not support %s-minute timeframe.",
+            minutes,
+            extra={"gateway_state": "history_warning"},
+        )
         return (None, None)
 
     def _estimate_history_limit(
@@ -1251,17 +1342,74 @@ class FubonGateway(BaseGateway):
         if not minutes_per_bar or minutes_per_bar <= 0:
             return None
 
-        total_minutes: Optional[float] = None
-        if start and end:
-            total_minutes = max((end - start).total_seconds() / 60, 0)
-        elif start and not end:
-            total_minutes = max((datetime.now(timezone.utc) - start).total_seconds() / 60, 0)
-
-        if not total_minutes or total_minutes <= 0:
+        total_minutes = self._estimate_trading_window_minutes(start, end)
+        if total_minutes is None:
             return None
+        if total_minutes <= 0:
+            return 1
 
-        estimated = int(total_minutes / minutes_per_bar) + 5
-        return max(1, min(estimated, 2000))
+        bars = int(ceil(total_minutes / minutes_per_bar))
+        buffer = max(5, int(ceil(bars * 0.05)))
+        estimated = bars + buffer
+        return max(1, min(estimated, self._rest_candles_limit))
+
+    def _estimate_trading_window_minutes(
+        self,
+        start: Optional[datetime],
+        end: Optional[datetime],
+    ) -> Optional[int]:
+        start_utc = self._ensure_utc(start)
+        if start_utc is None:
+            return None
+        end_utc = self._ensure_utc(end)
+        if end_utc is None:
+            end_utc = datetime.now(timezone.utc)
+        if end_utc <= start_utc:
+            return 0
+
+        start_local = start_utc.astimezone(TAIPEI_TZ)
+        end_local = end_utc.astimezone(TAIPEI_TZ)
+
+        total_minutes = 0
+        current_date = (start_local - timedelta(days=1)).date()
+        end_date = end_local.date()
+        while current_date <= end_date:
+            for window_start, window_end in self._iter_trading_sessions(current_date):
+                overlap = self._calculate_minute_overlap(start_local, end_local, window_start, window_end)
+                if overlap > 0:
+                    total_minutes += overlap
+            current_date += timedelta(days=1)
+        return total_minutes
+
+    def _iter_trading_sessions(
+        self,
+        base_date: dt_date,
+    ) -> Sequence[Tuple[datetime, datetime]]:
+        sessions: List[Tuple[datetime, datetime]] = []
+        weekday = base_date.weekday()
+        if weekday < 5:
+            day_start = datetime.combine(base_date, DAY_SESSION_START, tzinfo=TAIPEI_TZ)
+            day_end = datetime.combine(base_date, DAY_SESSION_END, tzinfo=TAIPEI_TZ)
+            sessions.append((day_start, day_end))
+        if weekday != 5:
+            night_start = datetime.combine(base_date, NIGHT_SESSION_START, tzinfo=TAIPEI_TZ)
+            next_date = base_date + timedelta(days=1)
+            night_end = datetime.combine(next_date, NIGHT_SESSION_END, tzinfo=TAIPEI_TZ)
+            sessions.append((night_start, night_end))
+        return sessions
+
+    def _calculate_minute_overlap(
+        self,
+        range_start: datetime,
+        range_end: datetime,
+        window_start: datetime,
+        window_end: datetime,
+    ) -> int:
+        overlap_start = max(range_start, window_start)
+        overlap_end = min(range_end, window_end)
+        if overlap_end <= overlap_start:
+            return 0
+        return int(ceil((overlap_end - overlap_start).total_seconds() / 60.0))
 
     def _filter_history_window(
         self,
