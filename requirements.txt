@@ -2,5 +2,6 @@ fastapi>=0.110,<0.116
 uvicorn[standard]>=0.25,<0.31
 requests>=2.31,<3
 websockets>=11,<12
-vnpy>=3.9,<4
+vnpy>4
 tomli>=2.0,<3; python_version < "3.11"
+importlib-metadata>=6,<7; python_version < "3.11"

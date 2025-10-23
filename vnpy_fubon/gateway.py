@@ -68,19 +68,22 @@ class FubonGateway(BaseGateway):
     """
 
     default_name = "FUBON"
+    exchanges: List[Exchange] = []
 
     def __init__(
         self,
         event_engine: Any,
+        gateway_name: str = default_name,
         *,
         connector: Optional[FubonAPIConnector] = None,
         client: Any = None,
-        log_level: int = logging.INFO,
-        gateway_name: str = "Fubon",
+        log_level: Optional[int] = None,
+        **_: Any,
     ) -> None:
         super().__init__(event_engine, gateway_name)
+        resolved_log_level = log_level if log_level is not None else logging.INFO
         self.logger = configure_logging(
-            log_level=log_level,
+            log_level=resolved_log_level,
             logger_name="vnpy_fubon.gateway",
             gateway_name=gateway_name,
         )
@@ -736,6 +739,33 @@ class FubonGateway(BaseGateway):
         )
         return result
 
+    def modify_order_lot(
+        self,
+        order_id: str,
+        new_lot: int,
+        *,
+        account_id: Optional[str] = None,
+        unblock: Optional[bool] = None,
+    ) -> OrderData:
+        if not self.order_api:
+            raise RuntimeError("Gateway not connected.")
+        account_obj = self._get_account_object(account_id)
+        if account_obj is None:
+            raise RuntimeError("No account context available for modify_lot.")
+        result = self.order_api.modify_order_lot(
+            order_id,
+            new_lot,
+            account=account_obj,
+            account_id=account_id or self.primary_account_id,
+            unblock=unblock,
+        )
+        self._put_event(EVENT_ORDER, result)
+        self.write_log(
+            f"Modify lot requested for order {order_id} -> new_lot={new_lot}",
+            state="modify_lot",
+        )
+        return result
+
     def query_close_position_records(
         self,
         start_date: str,
@@ -756,6 +786,31 @@ class FubonGateway(BaseGateway):
                 f"Closed position {record.symbol} {record.direction} volume={record.volume} pnl={record.pnl}",
             )
         return records
+
+    def query_order_history(
+        self,
+        start_date: str,
+        end_date: Optional[str] = None,
+        *,
+        account_id: Optional[str] = None,
+        market_type: Optional[Any] = None,
+    ) -> Sequence[OrderData]:
+        if not self.order_api:
+            return []
+        account_obj = self._get_account_object(account_id)
+        if account_obj is None:
+            self.logger.warning("No active account available for order history query.")
+            return []
+        orders = self.order_api.query_order_history(
+            account_obj,
+            start_date,
+            end_date,
+            market_type=market_type,
+            account_id=account_id or self.primary_account_id,
+        )
+        for order in orders:
+            self._put_event(EVENT_ORDER, order)
+        return orders
 
     def convert_symbol(
         self,
@@ -827,6 +882,50 @@ class FubonGateway(BaseGateway):
 
     def query_contracts(self) -> Sequence[ContractData]:
         return list(self.contracts.values())
+
+    def query_history(self, request: HistoryRequest) -> Sequence[BarData]:
+        """
+        Fetch historical bar data for CTA backtesting integrations.
+        """
+
+        if request is None:
+            return []
+
+        symbol = (request.symbol or "").strip()
+        if not symbol:
+            self.logger.warning(
+                "query_history called without a symbol.",
+                extra={"gateway_state": "history_warning"},
+            )
+            return []
+
+        timeframe, minutes_per_bar = self._resolve_history_timeframe(request.interval)
+        if timeframe is None:
+            self.logger.warning(
+                "Unsupported interval %s for historical data request.",
+                request.interval,
+                extra={"gateway_state": "history_warning"},
+            )
+            return []
+
+        normalized_start = self._ensure_utc(request.start)
+        normalized_end = self._ensure_utc(request.end)
+        limit = self._estimate_history_limit(normalized_start, normalized_end, minutes_per_bar)
+
+        try:
+            bars = self.fetch_candles(symbol, timeframe=timeframe, limit=limit)
+        except Exception as exc:  # pragma: no cover - vendor behaviour
+            self.logger.warning(
+                "Historical data download failed for %s: %s",
+                symbol,
+                exc,
+                extra={"gateway_state": "history_error"},
+            )
+            return []
+
+        filtered = self._filter_history_window(bars, normalized_start, normalized_end)
+        filtered.sort(key=lambda bar: bar.datetime)
+        return filtered
 
     def get_default_setting(self) -> Mapping[str, Any]:
         """
@@ -1107,6 +1206,93 @@ class FubonGateway(BaseGateway):
             if bar:
                 bars.append(bar)
         return bars
+
+    def _resolve_history_timeframe(
+        self,
+        interval: Optional[Interval],
+    ) -> Tuple[Optional[Any], Optional[int]]:
+        value: Optional[Any] = getattr(interval, "value", interval) if interval is not None else None
+        if value is None:
+            return ("1m", 1)
+
+        if isinstance(value, str):
+            mapping: Dict[str, Tuple[Optional[Any], Optional[int]]] = {
+                "1m": ("1m", 1),
+                "3m": ("3m", 3),
+                "5m": ("5m", 5),
+                "15m": ("15m", 15),
+                "30m": ("30m", 30),
+                "60m": ("60m", 60),
+                "1h": ("1h", 60),
+                "d": ("1d", 1440),
+                "1d": ("1d", 1440),
+                "day": ("1d", 1440),
+                "w": ("1w", 10080),
+                "1w": ("1w", 10080),
+                "week": ("1w", 10080),
+                "tick": (None, None),
+            }
+            resolved = mapping.get(value.lower())
+            if resolved:
+                return resolved
+
+        if isinstance(value, (int, float)):
+            minutes = int(value)
+            return (minutes, minutes)
+
+        return (None, None)
+
+    def _estimate_history_limit(
+        self,
+        start: Optional[datetime],
+        end: Optional[datetime],
+        minutes_per_bar: Optional[int],
+    ) -> Optional[int]:
+        if not minutes_per_bar or minutes_per_bar <= 0:
+            return None
+
+        total_minutes: Optional[float] = None
+        if start and end:
+            total_minutes = max((end - start).total_seconds() / 60, 0)
+        elif start and not end:
+            total_minutes = max((datetime.now(timezone.utc) - start).total_seconds() / 60, 0)
+
+        if not total_minutes or total_minutes <= 0:
+            return None
+
+        estimated = int(total_minutes / minutes_per_bar) + 5
+        return max(1, min(estimated, 2000))
+
+    def _filter_history_window(
+        self,
+        bars: Sequence[BarData],
+        start: Optional[datetime],
+        end: Optional[datetime],
+    ) -> List[BarData]:
+        start_utc = self._ensure_utc(start)
+        end_utc = self._ensure_utc(end)
+        if not start_utc and not end_utc:
+            return list(bars)
+
+        filtered: List[BarData] = []
+        for bar in bars:
+            dt = getattr(bar, "datetime", None)
+            if dt is None:
+                continue
+            compare_dt = self._ensure_utc(dt)
+            if start_utc and compare_dt < start_utc:
+                continue
+            if end_utc and compare_dt > end_utc:
+                continue
+            filtered.append(bar)
+        return filtered
+
+    def _ensure_utc(self, value: Optional[datetime]) -> Optional[datetime]:
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
 
     def fetch_trades_history(
         self,

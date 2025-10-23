@@ -20,6 +20,7 @@ dependencies = [
   "requests>=2.31,<3",
   "websockets>=11,<12",
   "vnpy>=3.9,<4",
+  'importlib-metadata>=6,<7; python_version < "3.11"',
 ]
 
 [project.optional-dependencies]

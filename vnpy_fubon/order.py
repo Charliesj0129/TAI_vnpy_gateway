@@ -196,6 +196,55 @@ class OrderAPI:
         self.logger.info("Cancel result for %s -> %s (raw=%s)", order_id, result, response)
         return result
 
+    def modify_order_lot(
+        self,
+        order_id: str,
+        new_lot: int,
+        **kwargs: Any,
+    ) -> OrderData:
+        futopt = getattr(self.client, "futopt", None)
+        if futopt is None:
+            raise FubonSDKMethodNotFoundError(
+                f"Client {type(self.client).__name__} does not expose futopt module."
+            )
+
+        maker = getattr(futopt, "make_modify_lot_obj", None)
+        modify_method = getattr(futopt, "modify_lot", None)
+        if not callable(maker) or not callable(modify_method):
+            raise FubonSDKMethodNotFoundError(
+                f"modify_lot utilities missing on client {type(self.client).__name__}."
+            )
+
+        account_obj = self._get_sdk_account(kwargs.get("account"), kwargs.get("account_id"))
+        if account_obj is None:
+            account_obj = self._get_sdk_account()
+        if account_obj is None:
+            raise RuntimeError("Unable to resolve account context for modify_lot.")
+
+        order_result = kwargs.get("order_result")
+        if order_result is None:
+            order_result = self._find_sdk_order_result_by_id(futopt, account_obj, order_id, kwargs)
+            if order_result is None:
+                raise ValueError(f"Order result for {order_id} not found; cannot modify lot.")
+
+        modify_obj = maker(order_result, int(new_lot))
+        unblock = kwargs.get("unblock")
+        try:
+            if unblock is not None:
+                response = modify_method(account_obj, modify_obj, unblock=unblock)
+            else:
+                response = modify_method(account_obj, modify_obj)
+        except TypeError:
+            if unblock is not None:
+                response = modify_method(account_obj, modify_obj, unblock)
+            else:
+                response = modify_method(account_obj, modify_obj)
+
+        payload = self._unwrap_order_response(response)
+        order_data = self._to_order_data(payload, {"order_id": order_id})
+        self.logger.info("Modify lot for %s -> %s (raw=%s)", order_id, order_data, response)
+        return order_data
+
     def query_open_orders(self, **kwargs: Any) -> List[OrderData]:
         method = self._resolve_method(QUERY_ORDER_METHODS)
         response = method(**kwargs)
@@ -236,6 +285,41 @@ class OrderAPI:
         for entry in entries:
             trades.append(self._to_trade_data(entry))
         return trades
+
+    def query_order_history(
+        self,
+        account: Any,
+        start_date: str,
+        end_date: Optional[str] = None,
+        *,
+        market_type: Optional[Any] = None,
+        **kwargs: Any,
+    ) -> List[OrderData]:
+        futopt = getattr(self.client, "futopt", None)
+        method = getattr(futopt, "order_history", None) if futopt else None
+        if not callable(method):
+            raise FubonSDKMethodNotFoundError(
+                f"Client {type(self.client).__name__} does not expose futopt.order_history."
+            )
+
+        market = kwargs.get("market_type") or kwargs.get("marketType") or market_type
+        market_enum = self._coerce_market_type(market)
+        if market_enum is not None and FutOptMarketType is not None:
+            market = market_enum
+
+        try:
+            if end_date is not None:
+                response = method(account, market, start_date, end_date)
+            else:
+                response = method(account, market, start_date)
+        except TypeError:
+            response = method(account, market, start_date, end_date)
+
+        entries = self._extract_order_entries(response)
+        history: List[OrderData] = []
+        for entry in entries:
+            history.append(self._to_order_data(entry, {}))
+        return history
 
     def _resolve_method(self, candidates: Iterable[str]) -> Any:
         for name in candidates:
