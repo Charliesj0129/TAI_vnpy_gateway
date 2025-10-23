@@ -11,7 +11,14 @@ from decimal import Decimal, InvalidOperation
 from typing import Any, Iterable, List, Mapping, Optional
 
 from .exceptions import FubonSDKMethodNotFoundError
-from .vnpy_compat import AccountData, Direction, EquityData, Exchange, PositionData
+from .vnpy_compat import (
+    AccountData,
+    ClosePositionRecord,
+    Direction,
+    EquityData,
+    Exchange,
+    PositionData,
+)
 
 ACCOUNT_QUERY_METHODS = ("query_account", "get_account_info", "QueryAccount")
 POSITION_QUERY_METHODS = ("query_positions", "get_positions", "QueryPositions")
@@ -78,6 +85,14 @@ def _first_value(payload: Mapping[str, Any], *keys: str) -> Any:
             if value not in (None, ""):
                 return value
     return None
+
+
+def _extract_position_entries(payload: Any) -> List[Mapping[str, Any]]:
+    if isinstance(payload, Mapping):
+        data = payload.get("data")
+        if data is not None:
+            return _extract_list(data)
+    return _extract_list(payload)
 
 
 def _parse_timestamp(value: Any) -> datetime:
@@ -150,7 +165,22 @@ class AccountAPI:
         response = method(**kwargs)
         return self._to_account_data(response)
 
-    def query_positions(self, **kwargs: Any) -> List[PositionData]:
+    def query_positions(self, *, account: Any = None, **kwargs: Any) -> List[PositionData]:
+        accounting = getattr(self.client, "futopt_accounting", None)
+        target_account = account or kwargs.get("account")
+
+        if accounting is not None and target_account is not None:
+            method = getattr(accounting, "query_hybrid_position", None) or getattr(
+                accounting, "query_single_position", None
+            )
+            if callable(method):
+                try:
+                    response = method(target_account)
+                    entries = _extract_position_entries(response)
+                    return [self._to_position_data(item) for item in entries]
+                except Exception as exc:
+                    self.logger.debug("futopt_accounting position query failed: %s", exc, extra={"account": target_account})
+
         method = self._resolve_method(POSITION_QUERY_METHODS)
         response = method(**kwargs)
         positions_raw = _extract_list(response)
@@ -187,6 +217,41 @@ class AccountAPI:
             except Exception as exc:
                 self.logger.debug("Failed to map equity payload %s: %s", item, exc)
         return equities
+
+    def query_close_position_records(
+        self,
+        account: Any,
+        start_date: str,
+        end_date: Optional[str] = None,
+    ) -> List[ClosePositionRecord]:
+        accounting = getattr(self.client, "futopt_accounting", None)
+        if accounting is None:
+            raise FubonSDKMethodNotFoundError(
+                f"Client {type(self.client).__name__} does not expose futopt_accounting module."
+            )
+        method = getattr(accounting, "close_position_record", None)
+        if not callable(method):
+            raise FubonSDKMethodNotFoundError(
+                f"futopt_accounting on {type(self.client).__name__} has no close_position_record()."
+            )
+
+        account_id = _resolve_account_id(account) or "UNKNOWN"
+        try:
+            if end_date is not None:
+                response = method(account, start_date, end_date)
+            else:
+                response = method(account, start_date)
+        except TypeError:
+            response = method(account, start_date, end_date)
+
+        entries = _extract_list(response.get("data") if isinstance(response, Mapping) else response)
+        records: List[ClosePositionRecord] = []
+        for entry in entries:
+            try:
+                records.append(self._to_close_position_record(entry, account_id))
+            except Exception as exc:
+                self.logger.debug("Failed to map close position payload %s: %s", entry, exc)
+        return records
 
     def snapshot(self) -> AccountSnapshot:
         """
@@ -363,18 +428,81 @@ class AccountAPI:
             extra=extra,
         )
 
-    def _to_position_data(self, payload: Mapping[str, Any]) -> PositionData:
-        symbol = str(payload.get("symbol") or payload.get("code") or "")
-        exchange = _normalize_exchange(payload.get("exchange"))
-        direction = _normalise_direction(payload.get("direction") or payload.get("side"))
-        volume = _ensure_decimal(payload.get("volume") or payload.get("qty") or 0)
-        frozen = _ensure_decimal(payload.get("frozen") or payload.get("hold") or 0)
-        price = _ensure_decimal(payload.get("avg_price") or payload.get("price") or 0)
-        pnl = _ensure_decimal(payload.get("unrealized_pnl") or payload.get("pnl") or 0)
-        yd_volume = _ensure_decimal(payload.get("yd_volume") or payload.get("yesterday_volume") or 0)
+    def _to_close_position_record(self, payload: Mapping[str, Any], account_id: str) -> ClosePositionRecord:
+        if not isinstance(payload, Mapping):
+            raise TypeError(f"Close position payload must be mapping, got {type(payload)}")
 
-        timestamp_raw = payload.get("timestamp") or payload.get("update_time")
+        used_keys: set[str] = set()
+
+        def pick(*keys: str) -> Any:
+            used_keys.update(keys)
+            return _first_value(payload, *keys)
+
+        def pick_decimal(*keys: str) -> Decimal:
+            return _ensure_decimal(pick(*keys))
+
+        symbol = str(pick("symbol", "code", "contractId") or "")
+        exchange = _normalize_exchange(pick("exchange", "market"))
+        direction = _normalise_direction(pick("direction", "side"))
+        volume = pick_decimal("volume", "qty", "quantity")
+        price = pick_decimal("price", "match_price", "closePrice")
+        pnl = pick_decimal("pnl", "realized_pnl", "realizedPnl")
+        close_time = _parse_timestamp(pick("close_time", "closeTime", "timestamp", "date"))
+
+        used_keys.update({"symbol", "code", "contractId", "exchange", "market", "direction", "side"})
+        extra = {key: value for key, value in payload.items() if key not in used_keys}
+
+        record = ClosePositionRecord(
+            accountid=str(account_id),
+            symbol=symbol,
+            exchange=exchange,
+            direction=direction,
+            volume=volume,
+            price=price,
+            pnl=pnl,
+            close_time=close_time,
+            extra=extra,
+        )
+        return record
+
+    def _to_position_data(self, payload: Mapping[str, Any]) -> PositionData:
+        if not isinstance(payload, Mapping):
+            raise TypeError(f"Position payload must be mapping, got {type(payload)}")
+
+        used_keys: set[str] = set()
+
+        def pick(*keys: str) -> Any:
+            used_keys.update(keys)
+            return _first_value(payload, *keys)
+
+        def pick_decimal(*keys: str) -> Decimal:
+            return _ensure_decimal(pick(*keys))
+
+        symbol = str(pick("symbol", "code", "contractId") or "")
+        exchange = _normalize_exchange(pick("exchange", "market"))
+        direction = _normalise_direction(pick("direction", "side"))
+        volume = pick_decimal("volume", "qty", "quantity", "net_volume")
+        frozen = pick_decimal("frozen", "hold", "on_hold")
+        price = pick_decimal("avg_price", "price", "average_price")
+        pnl = pick_decimal("unrealized_pnl", "pnl", "unrealizedPnl")
+        yd_volume = pick_decimal("yd_volume", "yesterday_volume", "overnight_position")
+
+        timestamp_raw = pick("timestamp", "update_time", "as_of", "date")
         timestamp = _parse_timestamp(timestamp_raw)
+
+        extra_fields: Dict[str, Any] = {
+            "expiry_date": pick("expiry_date", "expiryDate"),
+            "strike_price": pick("strike_price", "strikePrice"),
+            "call_put": pick("call_put", "option_type", "callPut"),
+            "is_spread": pick("is_spread", "isSpread"),
+            "spreads": pick("spreads", "legs"),
+            "margin": pick("margin", "required_margin"),
+        }
+
+        extra = {key: value for key, value in payload.items() if key not in used_keys}
+        for key, value in extra_fields.items():
+            if value not in (None, ""):
+                extra.setdefault(key, value)
 
         position = PositionData(
             symbol=symbol,
@@ -387,6 +515,7 @@ class AccountAPI:
             yd_volume=yd_volume,
             gateway_name=self.gateway_name,
             timestamp=timestamp,
+            extra=extra,
         )
         self.logger.debug("Mapped position payload %s to %s", payload, position)
         return position

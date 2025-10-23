@@ -194,6 +194,29 @@ except ImportError:  # pragma: no cover - default for most development environme
         yd_volume: Decimal
         gateway_name: str
         timestamp: Optional[datetime] = None
+        extra: Dict[str, Any] = field(default_factory=dict)
+
+    @dataclass
+    class EstimateMarginData:
+        accountid: str
+        symbol: str
+        currency: str
+        estimate_margin: Decimal
+        date: Optional[datetime] = None
+        extra: Dict[str, Any] = field(default_factory=dict)
+
+    @dataclass
+    class ClosePositionRecord:
+        accountid: str
+        symbol: str
+        exchange: Exchange
+        direction: Direction
+        volume: Decimal
+        price: Decimal
+        pnl: Decimal
+        close_time: datetime
+        gateway_name: str = "Fubon"
+        extra: Dict[str, Any] = field(default_factory=dict)
 
 
     @dataclass
@@ -371,10 +394,12 @@ except ImportError:  # pragma: no cover - default for most development environme
 __all__ = [
     "AccountData",
     "BaseGateway",
+    "ClosePositionRecord",
     "ContractData",
     "Direction",
     "Exchange",
     "EquityData",
+    "EstimateMarginData",
     "Event",
     "BarData",
     "LogData",

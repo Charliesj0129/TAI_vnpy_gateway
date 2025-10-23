@@ -17,7 +17,16 @@ from .mappings import (
     ORDER_TYPE_MAP,
     ORDER_TYPE_REVERSE_MAP,
 )
-from .vnpy_compat import Direction, Exchange, Offset, OrderData, OrderRequest, OrderStatus, TradeData
+from .vnpy_compat import (
+    Direction,
+    EstimateMarginData,
+    Exchange,
+    Offset,
+    OrderData,
+    OrderRequest,
+    OrderStatus,
+    TradeData,
+)
 
 try:  # pragma: no cover - optional vendor dependencies
     from fubon_neo.constant import (
@@ -140,6 +149,36 @@ class OrderAPI:
         self.logger.info("Order placed: %s (raw=%s)", order_data, response)
         return order_data
 
+    def estimate_margin(
+        self,
+        account: Any,
+        request: OrderRequest | Mapping[str, Any],
+        extra_payload: Optional[Mapping[str, Any]] = None,
+    ) -> EstimateMarginData:
+        futopt = getattr(self.client, "futopt", None)
+        method = getattr(futopt, "query_estimate_margin", None) if futopt else None
+        if not callable(method):
+            raise FubonSDKMethodNotFoundError(
+                f"Client {type(self.client).__name__} does not expose futopt.query_estimate_margin."
+            )
+
+        payload = self._build_order_payload(request)
+        if extra_payload:
+            payload.update(extra_payload)
+
+        order_args = self._build_futopt_order_args(payload)
+        if order_args is None:
+            raise ValueError("Unable to build SDK order object for margin estimation.")
+
+        account_id = self._resolve_account_identifier(account) or payload.get("account_id") or self.account_id or "UNKNOWN"
+        try:
+            response = method(account, order_args["order"])
+        except TypeError:
+            response = method(account, order_args["order"])
+
+        estimate_payload = self._extract_estimate_margin_payload(response)
+        return self._to_estimate_margin(account_id, payload.get("symbol"), estimate_payload)
+
     def cancel_order(self, order_id: str, **kwargs: Any) -> bool:
         futopt = getattr(self.client, "futopt", None)
         futopt_cancel = getattr(futopt, "cancel_order", None) if futopt else None
@@ -181,7 +220,7 @@ class OrderAPI:
         market_type_value = normalized_kwargs.get("market_type") or normalized_kwargs.get("marketType")
         coerced_market_type = self._coerce_market_type(market_type_value)
         if coerced_market_type is not None:
-            normalized_kwargs["market_type"] = coerced_market_type
+            normalized_kwargs["market_type"] = self._format_market_type_string(coerced_market_type)
             normalized_kwargs.pop("marketType", None)
 
         method = self._resolve_method(QUERY_TRADE_METHODS)
@@ -252,6 +291,64 @@ class OrderAPI:
         self.logger.info("Order placed via FutOpt: %s (raw=%s)", order_data, response)
         return order_data
 
+    def _extract_estimate_margin_payload(self, response: Any) -> Mapping[str, Any]:
+        if isinstance(response, Mapping):
+            data = response.get("data")
+            if isinstance(data, Mapping):
+                return data
+            if isinstance(data, (list, tuple)) and data:
+                first = data[0]
+                if isinstance(first, Mapping):
+                    return first
+            return response
+        data_attr = getattr(response, "data", None)
+        if isinstance(data_attr, Mapping):
+            return data_attr
+        return {}
+
+    def _to_estimate_margin(
+        self,
+        account_id: Any,
+        symbol: Any,
+        payload: Mapping[str, Any],
+    ) -> EstimateMarginData:
+        currency = str(payload.get("currency") or "TWD")
+        estimate_value = _ensure_decimal(
+            payload.get("estimate_margin") or payload.get("estimateMargin") or payload.get("margin") or 0
+        )
+        date_raw = payload.get("date") or payload.get("query_date") or payload.get("time")
+        date = _parse_timestamp(date_raw)
+        extra = {
+            key: value
+            for key, value in payload.items()
+            if key not in {"currency", "estimate_margin", "estimateMargin", "margin", "date", "query_date", "time"}
+        }
+        return EstimateMarginData(
+            accountid=str(account_id),
+            symbol=str(symbol or ""),
+            currency=currency,
+            estimate_margin=estimate_value,
+            date=date,
+            extra=extra,
+        )
+
+    def _resolve_account_identifier(self, account: Any) -> Optional[str]:
+        if account is None:
+            return None
+        if isinstance(account, Mapping):
+            for key in ("account", "account_id", "acct", "id", "accountId"):
+                value = account.get(key)
+                if value not in (None, ""):
+                    return str(value)
+        for attr in ("account", "account_id", "acct", "id", "accountId"):
+            try:
+                value = getattr(account, attr, None)
+            except Exception:
+                value = None
+            if value not in (None, ""):
+                return str(value)
+        return None
+
     def _query_trades_via_futopt(self, method: Any, params: Mapping[str, Any]) -> Optional[List[TradeData]]:
         account_obj = self._get_sdk_account(params.get("account"), params.get("account_id"))
         if account_obj is None:
@@ -262,8 +359,9 @@ class OrderAPI:
         end_date = params.get("end_date") or params.get("endDate")
         market_type = params.get("market_type") or params.get("marketType")
         market_type = self._coerce_market_type(market_type)
-        if market_type is None and FutOptMarketType is not None:
-            market_type = getattr(FutOptMarketType, "Future", None)
+        if market_type is None:
+            if FutOptMarketType is not None:
+                market_type = getattr(FutOptMarketType, "Future", None)
         if market_type is None:
             market_type = "Future"
 
@@ -469,10 +567,9 @@ class OrderAPI:
     def _map_market_type(self, payload: Mapping[str, Any], symbol: str) -> Any:
         code = payload.get("market_type") or payload.get("marketType")
         coerced = self._coerce_market_type(code)
-        if coerced is not None and FutOptMarketType is not None and isinstance(coerced, FutOptMarketType):  # type: ignore[arg-type]
+        if coerced is not None:
             return coerced
 
-        # Heuristic based on symbol prefix for options (commonly contain alphabetic suffix)
         if FutOptMarketType is None:
             return code or "Future"
 
@@ -481,10 +578,33 @@ class OrderAPI:
         return getattr(FutOptMarketType, "Future", None)
 
     def _coerce_market_type(self, value: Any) -> Any:
-        if value is None or FutOptMarketType is None:
+        if value is None:
+            return None
+        if FutOptMarketType is None:
+            return value
+        if isinstance(value, FutOptMarketType):  # type: ignore[arg-type]
             return value
         coerced = self._enum_member(FutOptMarketType, value)
-        return coerced or value
+        if coerced is not None:
+            return coerced
+        if isinstance(value, str):
+            text = value.strip()
+            if text:
+                attr = getattr(FutOptMarketType, text, None)
+                if isinstance(attr, FutOptMarketType):  # type: ignore[arg-type]
+                    return attr
+        return None
+
+    def _format_market_type_string(self, value: Any) -> str:
+        if FutOptMarketType is not None and isinstance(value, FutOptMarketType):  # type: ignore[arg-type]
+            text = str(value)
+            if "." in text:
+                return text.split(".")[-1]
+            return text
+        if isinstance(value, str):
+            text = value.strip()
+            return text or "Future"
+        return "Future"
 
     def _enum_member(self, enum_cls: Any, value: Any) -> Optional[Any]:
         if enum_cls is None or value is None:

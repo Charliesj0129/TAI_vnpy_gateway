@@ -33,8 +33,10 @@ from .vnpy_compat import (
     EVENT_TICK,
     EVENT_TRADE,
     LogData,
+    ClosePositionRecord,
     BarData,
     ContractData,
+    EstimateMarginData,
     OrderData,
     OrderRequest,
     PositionData,
@@ -614,6 +616,11 @@ class FubonGateway(BaseGateway):
                     return member
         return mode_value
 
+    def _get_account_object(self, account_id: Optional[str]) -> Optional[Any]:
+        if account_id:
+            return self.account_map.get(str(account_id))
+        return self.primary_account
+
     def query_account(self) -> Optional[AccountData]:
         if not self.account_api:
             return None
@@ -644,10 +651,54 @@ class FubonGateway(BaseGateway):
             self._put_event(EVENT_LOG, log_message)
         return equities
 
+    def estimate_margin(
+        self,
+        request: OrderRequest | Mapping[str, Any],
+        *,
+        account_id: Optional[str] = None,
+        extra_payload: Optional[Mapping[str, Any]] = None,
+    ) -> EstimateMarginData:
+        if not self.order_api:
+            raise RuntimeError("Gateway not connected.")
+        account_obj = self._get_account_object(account_id)
+        if account_obj is None:
+            raise RuntimeError("No account context available for margin estimation.")
+        result = self.order_api.estimate_margin(account_obj, request, extra_payload)
+        self._put_event(
+            EVENT_LOG,
+            f"Estimated margin for {result.symbol} ({result.currency}) -> {result.estimate_margin}",
+        )
+        return result
+
+    def query_close_position_records(
+        self,
+        start_date: str,
+        end_date: Optional[str] = None,
+        *,
+        account_id: Optional[str] = None,
+    ) -> Sequence[ClosePositionRecord]:
+        if not self.account_api:
+            return []
+        account_obj = self._get_account_object(account_id)
+        if account_obj is None:
+            self.logger.warning("No active account available for close position query.")
+            return []
+        records = self.account_api.query_close_position_records(account_obj, start_date, end_date)
+        for record in records:
+            self._put_event(
+                EVENT_LOG,
+                f"Closed position {record.symbol} {record.direction} volume={record.volume} pnl={record.pnl}",
+            )
+        return records
+
     def query_positions(self) -> Sequence[PositionData]:
         if not self.account_api:
             return []
-        positions = self.account_api.query_positions()
+        account_obj = self._get_account_object(None)
+        if account_obj is not None:
+            positions = self.account_api.query_positions(account=account_obj)
+        else:
+            positions = self.account_api.query_positions()
         for position in positions:
             self._put_event(EVENT_POSITION, position)
         return positions

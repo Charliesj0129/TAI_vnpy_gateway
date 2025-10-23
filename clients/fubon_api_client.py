@@ -19,7 +19,7 @@ import os
 from concurrent.futures import Future
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Any, Awaitable, Callable, Dict, Optional, Sequence
+from typing import Any, Awaitable, Callable, Dict, Mapping, Optional, Sequence, Tuple
 
 from fubon_neo.sdk import FubonSDK, Mode
 from fubon_neo.fugle_marketdata.constants import (
@@ -206,6 +206,7 @@ class FubonAPIClient:
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._ws = None
         self._subscriptions: Dict[str, Subscription] = {}
+        self._subscription_ids: Dict[Tuple[str, str], str] = {}
         self._pending_tasks: set[asyncio.Future[Any]] = set()
         self._ws_handlers_registered = False
         self._auto_reconnect_default = auto_reconnect
@@ -280,13 +281,27 @@ class FubonAPIClient:
             channel_name = channel.lower()
             if channel_name == "orderbook":
                 channel_name = "books"
-            payload: Dict[str, Any] = {"channel": channel_name, "symbol": subscription.symbol}
-            if subscription.depth is not None and channel in {"books", "orderbook"}:
+            payload: Dict[str, Any] = {"channel": channel_name}
+            symbols = subscription.extra.get("symbols") if isinstance(subscription.extra, Mapping) else None
+            if symbols and isinstance(symbols, Sequence):
+                payload["symbols"] = list(symbols)
+            else:
+                payload["symbols"] = [subscription.symbol]
+            if subscription.depth is not None and channel_name in {"books", "orderbook"}:
                 payload["depth"] = subscription.depth
             if subscription.after_hours is not None:
                 payload["afterHours"] = bool(subscription.after_hours)
-            payload.update(subscription.extra)
-            await asyncio.to_thread(self._ws.subscribe, payload)
+            extra_items = (
+                {key: value for key, value in subscription.extra.items() if key not in {"symbols", "symbol"}}
+                if isinstance(subscription.extra, Mapping)
+                else {}
+            )
+            payload.update(extra_items)
+            response = await asyncio.to_thread(self._ws.subscribe, payload)
+            parsed_ids = self._parse_subscription_ids(response, payload.get("symbols", []))
+            sub_id = parsed_ids.get(subscription.symbol)
+            if sub_id:
+                self._subscription_ids[(channel_name, subscription.symbol)] = sub_id
 
     async def unsubscribe(self, symbol: str) -> None:
         if self._ws is None:
@@ -294,12 +309,71 @@ class FubonAPIClient:
         sub = self._subscriptions.pop(symbol, None)
         if not sub:
             return
+        ids: list[str] = []
+        fallback_payloads: list[Dict[str, Any]] = []
         for channel in sub.channels:
             channel_name = channel.lower()
             if channel_name == "orderbook":
                 channel_name = "books"
-            payload: Dict[str, Any] = {"channel": channel_name, "symbol": symbol}
+            key = (channel_name, symbol)
+            sub_id = self._subscription_ids.pop(key, None)
+            if sub_id:
+                ids.append(sub_id)
+            else:
+                fallback_payloads.append({"channel": channel_name, "symbol": symbol})
+        if ids:
+            payload = {"ids": ids}
             await asyncio.to_thread(self._ws.unsubscribe, payload)
+        for payload in fallback_payloads:
+            await asyncio.to_thread(self._ws.unsubscribe, payload)
+
+    def _parse_subscription_ids(self, response: Any, symbols: Sequence[str]) -> Dict[str, str]:
+        parsed: Dict[str, str] = {}
+        targets = [str(symbol).strip() for symbol in symbols if str(symbol).strip()]
+
+        def record(symbol: Any, value: Any) -> None:
+            if symbol is None or value in (None, "", "null"):
+                return
+            symbol_str = str(symbol).strip()
+            if symbol_str in targets:
+                parsed[symbol_str] = str(value).strip()
+
+        def walk(payload: Any) -> None:
+            if payload is None:
+                return
+            if isinstance(payload, Mapping):
+                ids_value = payload.get("ids")
+                if isinstance(ids_value, (list, tuple)):
+                    for symbol, sub_id in zip(symbols, ids_value):
+                        record(symbol, sub_id)
+                id_value = (
+                    payload.get("id")
+                    or payload.get("subscriptionId")
+                    or payload.get("subscription_id")
+                    or payload.get("channelId")
+                    or payload.get("channel_id")
+                )
+                symbol_value = payload.get("symbol") or payload.get("code") or payload.get("target")
+                if symbol_value is not None:
+                    record(symbol_value, id_value)
+                elif id_value is not None and len(targets) == 1:
+                    record(targets[0], id_value)
+                for key in ("data", "result", "results", "responses", "subscriptions"):
+                    if key in payload:
+                        walk(payload[key])
+                attr_data = getattr(payload, "data", None)
+                if attr_data is not None and attr_data is not payload:
+                    walk(attr_data)
+                return
+            attr_data = getattr(payload, "data", None)
+            if attr_data is not None and attr_data is not payload:
+                walk(attr_data)
+            if isinstance(payload, (list, tuple, set)):
+                for item in payload:
+                    walk(item)
+
+        walk(response)
+        return parsed
 
     # ------------------------------------------------------------------ #
     # Websocket event wiring
