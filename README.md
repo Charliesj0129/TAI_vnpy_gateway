@@ -42,6 +42,21 @@ Or set environment variables (preferred for production use):
 | `FUBON_CA_PASSWORD` | Certificate password |
 | `FUBON_PRIMARY_ACCOUNT` | (Optional) default account number used by the gateway |
 
+
+Or manage them centrally in `vt_setting.json` by adding:
+
+```json
+{
+  "FUBON.user_id": "YOUR_FUBON_USER_ID",
+  "FUBON.password": "YOUR_FUBON_PASSWORD",
+  "FUBON.ca_path": "C:/Path/To/Certificate.pfx",
+  "FUBON.ca_password": "YOUR_CERT_PASSWORD",
+  "FUBON.account_id": "YOUR_PRIMARY_ACCOUNT"
+}
+```
+
+Values saved in `vt_setting.json` are applied automatically when you call `MainEngine.connect("FUBON")` and can still be overridden by explicit `connect()` parameters or environment variables.
+
 ### 4. Smoke-Test Connectivity
 
 ```powershell

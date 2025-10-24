@@ -261,12 +261,17 @@ def create_authenticated_client(
     config_path: Optional[Path] = None,
     dotenv_path: Optional[Path] = None,
     log_level: int = logging.INFO,
+    env_overrides: Optional[Mapping[str, Any]] = None,
 ) -> Tuple[Any, Any]:
     """
     Convenience wrapper that loads configuration and returns an authenticated client.
     """
 
-    credentials, sdk_config = load_configuration(config_path=config_path, dotenv_path=dotenv_path)
+    credentials, sdk_config = load_configuration(
+        config_path=config_path,
+        dotenv_path=dotenv_path,
+        env_overrides=env_overrides,
+    )
     connector = SdkSessionConnector(
         credentials=credentials,
         sdk_config=sdk_config,

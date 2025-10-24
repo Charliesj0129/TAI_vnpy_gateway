@@ -11,9 +11,21 @@ import os
 import threading
 import time
 from datetime import datetime, timezone, timedelta, time as dt_time, date as dt_date
+from pathlib import Path
 from threading import Timer
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 from math import ceil
+
+try:  # pragma: no cover - optional vn.py dependency
+    from vnpy.trader.setting import SETTINGS as _VN_GLOBAL_SETTINGS  # type: ignore[attr-defined]
+except Exception:  # pragma: no cover - gracefully handle absence of vn.py
+    _VN_GLOBAL_SETTINGS = {}
+if not isinstance(_VN_GLOBAL_SETTINGS, Mapping):
+    try:
+        _VN_GLOBAL_SETTINGS = dict(_VN_GLOBAL_SETTINGS)  # type: ignore[arg-type]
+    except Exception:  # pragma: no cover - defensive
+        _VN_GLOBAL_SETTINGS = {}
+GLOBAL_SETTINGS: Mapping[str, Any] = _VN_GLOBAL_SETTINGS  # type: ignore[assignment]
 
 from adapters.fubon_to_vnpy import MarketEnvelopeNormalizer
 from .account import AccountAPI
@@ -150,6 +162,7 @@ class FubonGateway(BaseGateway):
         """
 
         self.write_log("Connecting to Fubon gateway...", state="connecting")
+        resolved_values, env_overrides = self._resolve_connection_options(setting)
         if self.client is None:
             if self.connector is not None:
                 self.client, self.login_response = self.connector.connect()
@@ -165,10 +178,26 @@ class FubonGateway(BaseGateway):
                     if dotenv_value:
                         dotenv_path = Path(dotenv_value)
                     use_env_only = bool(setting.get("use_env_only"))
+                missing_fields = [
+                    name
+                    for name in ("user_id", "password", "ca_path", "ca_password")
+                    if not resolved_values.get(name)
+                ]
+                if missing_fields:
+                    message = (
+                        "Missing connection parameters: "
+                        + ", ".join(missing_fields)
+                        + ". Please configure them via connect(), vt_setting.json, or environment variables."
+                    )
+                    self.logger.error(message)
+                    self.write_log(message, state="error")
+                    return
+                env_payload = {key: value for key, value in env_overrides.items() if value}
                 self.client, self.login_response = create_authenticated_client(
                     config_path=None if use_env_only else config_path,
                     dotenv_path=dotenv_path,
                     log_level=self.logger.level,
+                    env_overrides=env_payload or None,
                 )
         else:
             self.login_response = getattr(self.client, "login_response", None)
@@ -176,7 +205,16 @@ class FubonGateway(BaseGateway):
         if self.client is None:
             raise RuntimeError("Failed to acquire Fubon SDK client.")
 
-        self._populate_account_metadata(setting)
+        preferred_account_setting: Optional[Mapping[str, Any]] = setting
+        preferred_account_id = resolved_values.get("account_id")
+        if preferred_account_id:
+            merged: Dict[str, Any] = {}
+            if setting:
+                merged.update(setting)
+            merged.setdefault("account_id", preferred_account_id)
+            preferred_account_setting = merged
+
+        self._populate_account_metadata(preferred_account_setting)
 
         self.account_api = AccountAPI(self.client, gateway_name=self.gateway_name, logger=self.logger)
         self.order_api = OrderAPI(
@@ -993,6 +1031,134 @@ class FubonGateway(BaseGateway):
             "ca_password": os.getenv("FUBON_CA_PASSWORD", ""),
             "account_id": os.getenv("FUBON_PRIMARY_ACCOUNT", ""),
         }
+
+    def _resolve_connection_options(
+        self,
+        setting: Optional[Mapping[str, Any]] = None,
+    ) -> Tuple[Dict[str, Optional[str]], Dict[str, Optional[str]]]:
+        values: Dict[str, Optional[str]] = {}
+        env_overrides: Dict[str, Optional[str]] = {}
+
+        def assign(
+            field: str,
+            env_key: Optional[str],
+            aliases: Sequence[str] = (),
+        ) -> Optional[str]:
+            resolved = self._resolve_config_value(field, setting, env_key=env_key, aliases=aliases)
+            if resolved is not None:
+                values[field] = resolved
+                if env_key:
+                    env_overrides[env_key] = resolved
+            return resolved
+
+        assign(
+            "user_id",
+            "FUBON_USER_ID",
+            aliases=("userid", "userId", "user", "account", "account_id", "accountId"),
+        )
+        assign(
+            "password",
+            "FUBON_USER_PASSWORD",
+            aliases=("user_password", "userPassword", "passwd", "userpwd", "password"),
+        )
+        assign(
+            "ca_path",
+            "FUBON_CA_PATH",
+            aliases=("cert_path", "certificate_path", "pfx_path", "ca", "caPath"),
+        )
+        assign(
+            "ca_password",
+            "FUBON_CA_PASSWORD",
+            aliases=("cert_password", "certificate_password", "pfx_password", "caPassword", "capassword", "capwd"),
+        )
+        assign(
+            "account_id",
+            "FUBON_PRIMARY_ACCOUNT",
+            aliases=("account", "accountId", "primary_account", "primaryAccount"),
+        )
+        client_class = self._resolve_config_value("client_class", setting, env_key="FUBON_SDK_CLIENT_CLASS")
+        if client_class is not None:
+            values["client_class"] = client_class
+            env_overrides["FUBON_SDK_CLIENT_CLASS"] = client_class
+        log_directory = self._resolve_config_value("log_directory", setting, env_key="FUBON_LOG_DIRECTORY")
+        if log_directory is not None:
+            values["log_directory"] = log_directory
+            env_overrides["FUBON_LOG_DIRECTORY"] = log_directory
+        extra_kwargs = self._resolve_config_value(
+            "extra_init_kwargs", setting, env_key="FUBON_SDK_EXTRA_INIT_KWARGS"
+        )
+        if extra_kwargs is not None:
+            values["extra_init_kwargs"] = extra_kwargs
+            env_overrides["FUBON_SDK_EXTRA_INIT_KWARGS"] = extra_kwargs
+
+        return values, env_overrides
+
+    def _resolve_config_value(
+        self,
+        key: str,
+        setting: Optional[Mapping[str, Any]] = None,
+        *,
+        env_key: Optional[str] = None,
+        aliases: Sequence[str] = (),
+    ) -> Optional[str]:
+        candidates = (key, *aliases)
+        resolved: Optional[Any] = None
+        if setting:
+            for candidate in candidates:
+                if candidate in setting:
+                    value = setting[candidate]
+                    if value not in (None, ""):
+                        resolved = value
+                        break
+        if resolved in (None, ""):
+            vt_value = self._get_vt_setting_value(key)
+            if vt_value not in (None, ""):
+                resolved = vt_value
+        if resolved in (None, "") and env_key:
+            env_value = os.getenv(env_key)
+            if env_value not in (None, ""):
+                resolved = env_value
+        if resolved in (None, ""):
+            return None
+        if isinstance(resolved, Path):
+            return str(resolved)
+        if isinstance(resolved, (int, float)):
+            return str(resolved)
+        text = str(resolved).strip()
+        return text or None
+
+    def _get_vt_setting_value(self, key: str) -> Optional[Any]:
+        if not GLOBAL_SETTINGS:
+            return None
+        prefixes = []
+        gateway_name = getattr(self, "gateway_name", None)
+        default_name = getattr(self, "default_name", None)
+        for candidate in (
+            gateway_name,
+            str(gateway_name).upper() if gateway_name else None,
+            default_name,
+            str(default_name).upper() if default_name else None,
+            "FUBON",
+        ):
+            if candidate:
+                prefixes.append(str(candidate))
+        seen: Set[str] = set()
+        for prefix in prefixes:
+            candidate_key = f"{prefix}.{key}"
+            if candidate_key in seen:
+                continue
+            seen.add(candidate_key)
+            value: Any = None
+            try:
+                value = GLOBAL_SETTINGS.get(candidate_key)  # type: ignore[attr-defined]
+            except AttributeError:
+                try:
+                    value = GLOBAL_SETTINGS[candidate_key]  # type: ignore[index]
+                except Exception:
+                    value = None
+            if value not in (None, ""):
+                return value
+        return None
 
     def _load_and_publish_contracts(self) -> None:
         records = self._fetch_contracts_from_rest()
@@ -2012,6 +2178,8 @@ class FubonGateway(BaseGateway):
                 or setting.get("account")
                 or setting.get("primary_account")
             )
+        if not preferred_account:
+            preferred_account = self._get_vt_setting_value("account_id")
         if not preferred_account:
             preferred_account = os.getenv("FUBON_PRIMARY_ACCOUNT")
 
