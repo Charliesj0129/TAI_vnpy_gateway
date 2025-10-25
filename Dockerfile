@@ -18,12 +18,12 @@ COPY --from=builder /opt/install /usr/local
 
 COPY requirements.txt ./requirements.txt
 COPY .env.template ./.env.template
-COPY main.py ./main.py
+COPY examples ./examples
 COPY fubon_connect.py ./fubon_connect.py
 COPY adapters ./adapters
 COPY clients ./clients
 COPY config/fubon_credentials.toml ./config/fubon_credentials.toml
-COPY docs/APIæ–‡æª”.md ./docs/APIæ–‡æª”.md
+COPY docs/API?‡æ?.md ./docs/API?‡æ?.md
 COPY docs/API_Analysis.md ./docs/API_Analysis.md
 COPY docs/PROJECT_OVERVIEW.md ./docs/PROJECT_OVERVIEW.md
 COPY vnpy_fubon ./vnpy_fubon
@@ -33,4 +33,4 @@ USER app
 EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
   CMD curl -fsS http://127.0.0.1:${PORT}/healthz || exit 1
-CMD ["bash", "-lc", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8080}"]
+CMD ["bash", "-lc", "uvicorn examples.fubon_service_api:app --host 0.0.0.0 --port ${PORT:-8080}"]

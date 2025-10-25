@@ -78,7 +78,7 @@ python tools/replay_ws_raw.py --symbol TXF202510 --from-ts 2025-10-16T08:30:00 -
 ## 5. 常見問題與排除
 
 - **REST 登入失敗**：檢查 `.env` 是否正確填入 `FUBON_USER_ID/FUBON_USER_PASSWORD/FUBON_CA_PATH/FUBON_CA_PASSWORD`；若使用憑證登入需確保檔案存在且密碼無誤。
-- **WS 無資料**：確認防火牆/VPN；可先運行 `python run.py` 內建示例確認連線品質。
+- **WS 無資料**：確認防火牆/VPN；可先運行 `python examples/run_fubon_gui.py` 內建示例確認連線品質。
 - **資料庫寫入緩慢**：調整 `config/pipeline.toml` 中 `batch_size`、`max_workers`，或將 `copy_enabled` 改為 `true`（需 PostgreSQL 14+）。
 - **延遲過高**：`RAW_BACKPRESSURE_MS` 會在延遲超過閾值時優先寫 `market_raw`，請檢視 `receive_latency_ms` 欄位判斷是否落地過慢。
 - **序號缺口持續存在**：確認對應 `reconcile_log` 是否已標為 `pending`，再透過 `backfill_gap.py` 或調整尺幅重新回補。

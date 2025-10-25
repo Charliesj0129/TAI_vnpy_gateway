@@ -3,7 +3,7 @@
 ## Summary
 - Removed deprecated legacy key/secret flows. All services, tools, and docs now require only `FUBON_USER_ID`, `FUBON_USER_PASSWORD`, `FUBON_CA_PATH`, `FUBON_CA_PASSWORD`. Added negative-path validation (HTTP 400) and updated ingest tooling, templates, and runbooks.
 - Archived non-runtime assets (tests, tools, scripts, logs, docs) into `extras/`.
-- Added FastAPI entrypoint (`main.py`) exposing `/healthz` and `/api/v1/session`.
+- Added FastAPI entrypoint (`examples/fubon_service_api.py`) exposing `/healthz` and `/api/v1/session`.
 - Normalised naming conflicts across adapters/clients/connector modules with aliases retained.
 - Introduced container assets (`Dockerfile`, `.dockerignore`) and Cloud Run deployment guide.
 - Added governance artefacts (`requirements.txt`, `pyproject.toml`, `.pre-commit-config.yaml`) reflecting minimal runtime dependencies.

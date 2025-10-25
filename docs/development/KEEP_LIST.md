@@ -1,10 +1,10 @@
 | Path                          | Reason |
 | ----------------------------- | ------ |
-| main.py                       | FastAPI entrypoint (`/healthz`, `/api/v1/session`) |
+| examples/fubon_service_api.py                       | FastAPI entrypoint (`/healthz`, `/api/v1/session`) |
 | adapters/fubon_to_vnpy.py     | Core market data normalisation logic |
 | clients/fubon_api_client.py   | Streaming REST/WS client helper |
 | config/fubon_credentials.toml | Minimal credential template |
-| docs/APIæ–‡æª”.md                | Canonical external API contract |
+| docs/API?‡æ?.md                | Canonical external API contract |
 | docs/API_Analysis.md          | Contract analysis reference |
 | docs/PROJECT_OVERVIEW.md      | Architecture overview |
 | fubon_connect.py              | Backwards compatibility wrapper |

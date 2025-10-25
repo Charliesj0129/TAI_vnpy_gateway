@@ -2,7 +2,7 @@
 
 ## Overview
 - `vnpy_fubon` ships a production-grade Fubon futures/options gateway for vn.py 2.x.
-- All orchestration is CLI-first; GUI startup mirrors `run.py`.
+- All orchestration is CLI-first; GUI startup mirrors `examples/run_fubon_gui.py`.
 - Live connectivity mixes REST (contracts/queries) and websocket (market data) flows.
 
 ## Environment & Secrets
@@ -23,7 +23,7 @@
 - Confirm log directory disk usage < 80%.
 
 ## Boot & Shutdown
-- **GUI**: `python run.py` (loads gateway + optional vn.py apps). Set `FUBON_TRADER_APPS` to comma separated app ids or `all`.
+- **GUI**: `python examples/run_fubon_gui.py` (loads gateway + optional vn.py apps). Set `FUBON_TRADER_APPS` to comma separated app ids or `all`.
 - **Programmatic**: instantiate `FubonGateway` via `MainEngine.add_gateway`.
 - **Shutdown**: call `gateway.close()` or exit GUI. The gateway ensures websocket disconnect, cancels token refresh timers, and clears contract caches.
 

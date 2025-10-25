@@ -5,7 +5,7 @@
    - Remove caches (`__pycache__`, `.pytest_cache`) and local virtualenvs to shrink footprint.
 
 2. **Introduce HTTP entrypoint & configuration**
-   - Add `main.py` FastAPI service exposing `/healthz` and `/api/v1/session`.
+   - Add `examples/fubon_service_api.py` FastAPI service exposing `/healthz` and `/api/v1/session`.
    - Reuse `SdkSessionConnector` and `load_configuration` for credential management.
 
 3. **Resolve naming inconsistencies**

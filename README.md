@@ -20,9 +20,20 @@ python -m venv .venv
 ### 2. Install Dependencies
 
 ```powershell
+pip install -r requirements.txt
+# Optional: developer tooling and linters
 pip install -r requirements-dev.txt
-pip install .\fubon_neo-2.2.3-cp37-abi3-win_amd64.whl  # supplied by Fubon
 ```
+
+> **Note**
+>
+> The proprietary `fubon_neo` SDK is not published on PyPI. Download the latest wheel from your brokerage channel and install it manually, for example:
+>
+> ```powershell
+> pip install C:\Path\To\fubon_neo-2.2.4-cp37-abi3-win_amd64.whl
+> ```
+>
+> The wheel is intentionally not version-controlled inside this repository.
 
 ### 3. Configure Credentials Securely
 
@@ -78,7 +89,7 @@ pytest
 - `tests/` ??Pytest suites (live API tests gated by `FUBON_ENABLE_LIVE_TESTS`).
 - `docs/` ??Architecture notes, API analysis, and project plans.
 - `config/` ??Credential/test-case templates (copy locally before editing).
-- `examples/` ??Demo scripts (e.g. `examples/fubon_event_engine_demo.py`).
+- `examples/` ??Demo scripts (e.g. `examples/run_fubon_gui.py`, `examples/fubon_service_api.py`).
 
 ## Gateway Usage
 
@@ -90,10 +101,16 @@ pytest
    $env:FUBON_USER_PASSWORD = "..."
    $env:FUBON_CA_PATH = "C:\CAFubon\<ID>\<ID>.pfx"
    $env:FUBON_CA_PASSWORD = "..."
-   python examples/fubon_event_engine_demo.py
+   python examples/run_fubon_gui.py
    ```
 
-   The demo subscribes to `TXFA4`, prints `EVENT_TICK`/`EVENT_ORDER`/`EVENT_TRADE`, and also echoes `EVENT_FUBON_MARKET_RAW` payloads so you can inspect raw `books`/`trades` frames.
+   The launcher boots the vn.py GUI with the Fubon gateway registered and installs the CTA apps used for backtesting and data inspection.
+
+   To spin up the FastAPI utility service, run:
+
+   ```powershell
+   uvicorn examples.fubon_service_api:app --reload
+   ```
 
 3. To switch accounts, set `FUBON_PRIMARY_ACCOUNT` (?ñÊñº `connect()` settings ?ê‰? `account_id`) Ôºå‰??ØÂú®Á®ãÂ?‰∏≠Âëº??`gateway.switch_account("Â∏≥Ë??üÁ¢º")`??
    The gateway now applies available SDK setters and warns via `EVENT_LOG` if validation shows the session is still pointing at the previous account.
